@@ -1,0 +1,4 @@
+# Several dependencies pull in `getrandom`; on wasm32-unknown-unknown it must use
+# the browser's `crypto.getRandomValues` through wasm-bindgen.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

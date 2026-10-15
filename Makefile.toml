@@ -1,0 +1,5 @@
+# `yarn` is packaged as `yarnpkg` on Debian/Ubuntu.
+[tasks.yarn]
+script = '''
+if command -v yarn >/dev/null 2>&1; then yarn run build; else yarnpkg run build; fi
+'''

@@ -1,0 +1,55 @@
+[package]
+name = "afirma-core"
+description = "Signature formats, keystores and signing logic for autofirma-rs (no browser dependencies)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# PAdES through `underskrift`. Off by default: underskrift 0.1.4 unconditionally depends on
+# `tsp-ltv` (blocking reqwest), which does not build for wasm32-unknown-unknown. Enable it
+# once the upstream fix lands (see PLAN.md §4.1).
+pades = ["dep:underskrift"]
+
+[dependencies]
+log.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+
+# RustCrypto, aligned with the versions used by `underskrift` (cms 0.2 / der 0.7 generation).
+cms = { version = "0.2", features = ["builder"] }
+const-oid = { version = "0.9", features = ["db"] }
+der = { version = "0.7", features = ["alloc", "derive", "oid"] }
+ecdsa = { version = "0.16", features = ["der", "signing", "verifying"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+pkcs8 = "0.10"
+rsa = { version = "0.9", features = ["sha2"] }
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+signature = "2"
+spki = "0.7"
+x509-cert = "0.2"
+zeroize = "1"
+
+# PKCS#12 (.p12 / .pfx) keystores. Uses the newer RustCrypto generation; keys cross into
+# the signing stack as PKCS#8 DER bytes.
+p12-keystore = "0.4"
+
+# XML canonicalization and transforms for XMLDSig / XAdES / FacturaE / ODF / OOXML.
+bergshamra-c14n = "0.10"
+bergshamra-transforms = { version = "0.10", default-features = false, features = ["rustcrypto"] }
+bergshamra-xml = "0.10"
+
+# PDF signing (PAdES).
+underskrift = { version = "0.1", default-features = false, features = ["visual"], optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Route every `getrandom` generation to `crypto.getRandomValues`.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }

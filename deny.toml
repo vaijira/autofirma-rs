@@ -1,0 +1,32 @@
+# The project is GPL-2.0-only: every dependency must be GPL-2.0-compatible.
+# Apache-2.0-only and GPL-3.0 crates are not allowed (PLAN.md §1).
+[licenses]
+allow = [
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CC0-1.0",
+]
+confidence-threshold = 0.9
+exceptions = [
+  # Our own crates.
+  { allow = ["GPL-2.0-only"], crate = "afirma-core" },
+  { allow = ["GPL-2.0-only"], crate = "afirma-web" },
+  { allow = ["GPL-2.0-only"], crate = "afirma-worker" },
+  { allow = ["GPL-2.0-only"], crate = "afirma-e2e" },
+  # Apache-2.0 only. Required by RustCrypto `der` 0.7 (cms, x509-cert, spki, pkcs8...),
+  # so it is shipped in the wasm bundle. Pending license decision, see PLAN.md §6.
+  { allow = ["Apache-2.0"], crate = "flagset" },
+  # Apache-2.0 only. Only used by the e2e test tooling (thirtyfour -> reqwest), never shipped.
+  { allow = ["Apache-2.0"], crate = "sync_wrapper" },
+]
+
+[advisories]
+ignore = []
+
+[bans]
+multiple-versions = "allow"

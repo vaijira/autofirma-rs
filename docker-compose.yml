@@ -1,0 +1,17 @@
+# Services for the end-to-end tests in crates/afirma-e2e.
+services:
+  selenium:
+    image: selenium/standalone-chrome:latest
+    shm_size: 2gb
+    environment:
+      - SE_NODE_MAX_SESSIONS=4
+    network_mode: "host"
+    volumes:
+      - ./tests/data:/test_data
+  static-web-server:
+    image: joseluisq/static-web-server:2
+    environment:
+      - SERVER_PORT=8080
+    network_mode: "host"
+    volumes:
+      - ./dist:/public
