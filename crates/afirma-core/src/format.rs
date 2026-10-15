@@ -18,6 +18,8 @@ pub enum DataKind {
     Zip,
     /// CMS / PKCS#7 SignedData structure (an existing CAdES or CMS signature).
     CmsSignedData,
+    /// Plain text (valid UTF-8 without control characters).
+    Text,
     /// Anything else.
     Binary,
 }
@@ -76,6 +78,9 @@ impl DataKind {
         if looks_like_xml(data) {
             return DataKind::Xml;
         }
+        if looks_like_text(data) {
+            return DataKind::Text;
+        }
         DataKind::Binary
     }
 
@@ -98,6 +103,8 @@ impl DataKind {
             DataKind::Ooxml => "Documento Office (OOXML)",
             DataKind::Zip => "Archivo ZIP",
             DataKind::CmsSignedData => "Firma CMS/CAdES",
+            // Same description AutoFirma writes in the CAdES `contentHint` attribute.
+            DataKind::Text => "Texto plano",
             DataKind::Binary => "Fichero binario",
         }
     }
@@ -127,6 +134,20 @@ fn is_cms_signed_data(data: &[u8]) -> bool {
     };
     data.get(2 + len_octets..)
         .is_some_and(|rest| rest.starts_with(SIGNED_DATA_OID))
+}
+
+fn looks_like_text(data: &[u8]) -> bool {
+    let sample = head(data, 8192);
+    // Do not reject a sample that ends in the middle of a multi-byte character.
+    let valid = match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none() && e.valid_up_to() + 4 > sample.len(),
+    };
+    !data.is_empty()
+        && valid
+        && sample
+            .iter()
+            .all(|&b| b >= 0x20 || matches!(b, b'\n' | b'\r' | b'\t' | 0x0c))
 }
 
 fn looks_like_xml(data: &[u8]) -> bool {
@@ -191,8 +212,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_text() {
+        assert_eq!(DataKind::detect("Hola, señor\n".as_bytes()), DataKind::Text);
+        assert_eq!(
+            DataKind::detect(b"hello").default_format(),
+            SignatureFormat::Cades
+        );
+    }
+
+    #[test]
     fn falls_back_to_binary() {
-        assert_eq!(DataKind::detect(b"hello"), DataKind::Binary);
+        assert_eq!(DataKind::detect(b"\x00\x01binary"), DataKind::Binary);
+        assert_eq!(DataKind::detect(b"\xff\xfe\x00"), DataKind::Binary);
         assert_eq!(DataKind::detect(b""), DataKind::Binary);
     }
 }

@@ -1,5 +1,6 @@
 use dominator::{Dom, html};
 
+pub mod certs;
 pub mod sign;
 
 /// Placeholder for views planned in later phases of PLAN.md.

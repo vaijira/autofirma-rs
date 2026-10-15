@@ -38,6 +38,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --target wasm32-unknown-unknown -p afirma-core -p afirma-web -p afirma-worker -- -D warnings
 ```
 
+Cross-validation with AutoFirma itself: this signs with every key, digest, mode and
+policy combination, then checks the results with AutoFirma's validator
+([tools/AfirmaValidate.java](tools/AfirmaValidate.java)) and `openssl cms -verify`. It needs
+Java, OpenSSL and AutoFirma installed:
+
+```sh
+cargo test -p afirma-core --test autofirma_interop -- --ignored
+```
+
+Test keystores live in `tests/data/certs` (password `1234`; regenerate them with `generate.sh`).
+Reference signatures made by AutoFirma live in `tests/data/cades`.
+
 The end-to-end tests need a built `dist/`. To run them with Selenium in Docker:
 
 ```sh

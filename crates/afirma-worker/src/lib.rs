@@ -11,7 +11,9 @@
     unused_extern_crates
 )]
 
-use afirma_core::job::{self, Request, WorkerEvent};
+use std::cell::RefCell;
+
+use afirma_core::job::{Engine, Request, WorkerEvent};
 use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
@@ -25,11 +27,13 @@ pub fn main_worker() -> Result<(), JsValue> {
     );
 
     let scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    // Loaded private keys live here, inside the worker, and never reach the UI thread.
+    let engine = RefCell::new(Engine::new());
     let onmessage = Closure::<dyn Fn(MessageEvent)>::new({
         let scope = scope.clone();
         move |event: MessageEvent| {
             let response = match serde_wasm_bindgen::from_value::<Request>(event.data()) {
-                Ok(request) => WorkerEvent::Response(job::handle(request)),
+                Ok(request) => WorkerEvent::Response(engine.borrow_mut().handle(request)),
                 Err(err) => {
                     log::error!("Invalid worker request: {err}");
                     return;

@@ -64,3 +64,53 @@ pub static HIDDEN_INPUT_CLASS: LazyLock<String> = LazyLock::new(|| {
         .style("display", "none")
     }
 });
+
+pub static OPTIONS_CLASS: LazyLock<String> = LazyLock::new(|| {
+    class! {
+        .style("display", "grid")
+        .style("grid-template-columns", "max-content minmax(0, 1fr)")
+        .style("gap", "0.5rem 1rem")
+        .style("align-items", "center")
+        .style("margin", "1rem 0")
+    }
+});
+
+pub static CARD_CLASS: LazyLock<String> = LazyLock::new(|| {
+    class! {
+        .style("border", "1px solid var(--border)")
+        .style("border-radius", "6px")
+        .style("padding", "0.75rem 1rem")
+        .style("margin", "0.75rem 0")
+    }
+});
+
+pub static CARD_SELECTED_CLASS: LazyLock<String> = LazyLock::new(|| {
+    class! {
+        .style("border-color", "var(--accent)")
+        .style("box-shadow", "0 0 0 1px var(--accent)")
+    }
+});
+
+pub static DIALOG_BACKDROP_CLASS: LazyLock<String> = LazyLock::new(|| {
+    class! {
+        .style("position", "fixed")
+        .style("inset", "0")
+        .style("background", "rgba(0, 0, 0, 0.45)")
+        .style("display", "flex")
+        .style("align-items", "center")
+        .style("justify-content", "center")
+        .style("padding", "1rem")
+        .style("z-index", "10")
+    }
+});
+
+pub static DIALOG_CLASS: LazyLock<String> = LazyLock::new(|| {
+    class! {
+        .style("background", "var(--bg)")
+        .style("color", "var(--fg)")
+        .style("border-radius", "8px")
+        .style("padding", "1.25rem")
+        .style("width", "min(26rem, 100%)")
+        .style("box-shadow", "0 10px 30px rgba(0, 0, 0, 0.3)")
+    }
+});

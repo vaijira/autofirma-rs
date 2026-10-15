@@ -24,33 +24,95 @@ async fn driver() -> WebDriverResult<WebDriver> {
     }
 }
 
+/// Waits for an element; prints the page source if it never shows up.
+async fn wait(driver: &WebDriver, by: By) -> WebDriverResult<WebElement> {
+    match driver
+        .query(by)
+        .wait(Duration::from_secs(10), Duration::from_millis(200))
+        .first()
+        .await
+    {
+        Ok(element) => Ok(element),
+        Err(err) => {
+            eprintln!("Page source on failure:\n{}", driver.source().await?);
+            Err(err)
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn analyzes_a_pdf_in_the_worker() -> WebDriverResult<()> {
     let driver = driver().await?;
     driver.goto(APP_URL).await?;
 
-    let input = driver.find(By::Id("sign_file")).await?;
-    input
+    wait(&driver, By::Id("sign_file"))
+        .await?
         .send_keys(format!("{}/sample.pdf", test_data()))
         .await?;
 
-    let sha256 = match driver
-        .query(By::Css("#file_sha256 td"))
-        .wait(Duration::from_secs(10), Duration::from_millis(200))
-        .first()
-        .await
-    {
-        Ok(element) => element,
-        Err(err) => {
-            eprintln!("Page source on failure:\n{}", driver.source().await?);
-            driver.quit().await?;
-            return Err(err);
-        }
-    };
+    let sha256 = wait(&driver, By::Css("#file_sha256 td")).await?;
     assert_eq!(sha256.text().await?.len(), 64);
-    let info = driver.find(By::Id("file_info")).await?.text().await?;
-    assert!(info.contains("PAdES"), "unexpected file info: {info}");
+    let format = driver
+        .find(By::Css("#file_format td"))
+        .await?
+        .text()
+        .await?;
+    assert_eq!(format, "PAdES");
+
+    driver.quit().await
+}
+
+#[tokio::test]
+#[ignore]
+async fn imports_certificate_and_signs_cades() -> WebDriverResult<()> {
+    let driver = driver().await?;
+    driver.goto(format!("{APP_URL}#/certs")).await?;
+
+    wait(&driver, By::Id("import_p12"))
+        .await?
+        .send_keys(format!("{}/certs/rsa.p12", test_data()))
+        .await?;
+
+    // Wrong password first: the dialog stays open with an error.
+    wait(&driver, By::Id("p12_password"))
+        .await?
+        .send_keys("bad")
+        .await?;
+    driver.find(By::Id("p12_unlock")).await?.click().await?;
+    let error = wait(&driver, By::Css("form[role=dialog] [role=alert]")).await?;
+    assert!(error.text().await?.contains("contraseña"));
+
+    let password = driver.find(By::Id("p12_password")).await?;
+    password.clear().await?;
+    password.send_keys("1234").await?;
+    driver.find(By::Id("p12_unlock")).await?.click().await?;
+
+    let card = wait(&driver, By::Css("#cert_list article")).await?;
+    assert!(card.text().await?.contains("ESPAÑOL ESPAÑOL JUAN"));
+
+    driver.find(By::LinkText("Firmar")).await?.click().await?;
+    wait(&driver, By::Id("sign_file"))
+        .await?
+        .send_keys(format!("{}/cades/doc.txt", test_data()))
+        .await?;
+    wait(&driver, By::Id("sign_button")).await?;
+    let certificate = driver
+        .find(By::Id("sign_certificate"))
+        .await?
+        .text()
+        .await?;
+    assert!(certificate.contains("JUAN"), "{certificate}");
+    driver.find(By::Id("sign_button")).await?.click().await?;
+
+    let result = wait(&driver, By::Id("signature_result")).await?;
+    assert!(result.text().await?.contains("Firma CAdES generada"));
+    let download = driver
+        .find(By::Id("download_signature"))
+        .await?
+        .text()
+        .await?;
+    assert!(download.contains("doc.txt.csig"), "{download}");
 
     driver.quit().await
 }

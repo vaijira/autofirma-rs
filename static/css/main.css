@@ -3,6 +3,7 @@
   --fg: #1d1d1f;
   --bg: #ffffff;
   --muted: #5f6368;
+  --border: #d0d0d5;
   color-scheme: light dark;
 }
 
@@ -11,6 +12,7 @@
     --fg: #e8e8ea;
     --bg: #18181b;
     --muted: #a1a1aa;
+    --border: #3f3f46;
   }
 }
 

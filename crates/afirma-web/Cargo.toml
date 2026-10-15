@@ -40,6 +40,7 @@ features = [
   "HtmlAnchorElement",
   "HtmlElement",
   "HtmlInputElement",
+  "HtmlSelectElement",
   "MessageEvent",
   "Url",
   "Window",

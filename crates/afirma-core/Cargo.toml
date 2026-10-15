@@ -22,14 +22,14 @@ serde_bytes.workspace = true
 thiserror.workspace = true
 
 # RustCrypto, aligned with the versions used by `underskrift` (cms 0.2 / der 0.7 generation).
-cms = { version = "0.2", features = ["builder"] }
+base64ct = { version = "1", features = ["alloc"] }
+cms = "0.2"
 const-oid = { version = "0.9", features = ["db"] }
-der = { version = "0.7", features = ["alloc", "derive", "oid"] }
-ecdsa = { version = "0.16", features = ["der", "signing", "verifying"] }
+der = { version = "0.7", features = ["alloc", "derive", "oid", "std"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 pkcs8 = "0.10"
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = "0.9"
 sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["oid"] }
 signature = "2"
@@ -39,7 +39,7 @@ zeroize = "1"
 
 # PKCS#12 (.p12 / .pfx) keystores. Uses the newer RustCrypto generation; keys cross into
 # the signing stack as PKCS#8 DER bytes.
-p12-keystore = "0.4"
+p12-keystore = { version = "0.4", features = ["pbes1"] }
 
 # XML canonicalization and transforms for XMLDSig / XAdES / FacturaE / ODF / OOXML.
 bergshamra-c14n = "0.10"

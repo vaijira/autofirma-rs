@@ -11,9 +11,14 @@
     unused_extern_crates
 )]
 
+pub mod algorithm;
+pub mod cades;
+pub mod cert;
 pub mod digest;
 pub mod error;
 pub mod format;
 pub mod job;
+pub mod keystore;
+pub mod policy;
 
 pub use error::{Error, Result};

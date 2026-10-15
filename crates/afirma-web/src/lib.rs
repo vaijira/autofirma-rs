@@ -16,6 +16,7 @@ mod components;
 mod css;
 mod pages;
 mod router;
+mod state;
 mod utils;
 mod worker;
 
