@@ -69,27 +69,27 @@ impl CertificateInfo {
 
     /// Extracts the information from a parsed certificate and its DER encoding.
     pub fn from_certificate(cert: &Certificate, der: &[u8]) -> Result<Self> {
-        let tbs = &cert.tbs_certificate;
+        let tbs = cert.tbs_certificate();
 
         let mut info = CertificateInfo {
-            subject: tbs.subject.to_string(),
-            subject_cn: common_name(&tbs.subject).unwrap_or_else(|| tbs.subject.to_string()),
-            issuer: tbs.issuer.to_string(),
-            issuer_cn: common_name(&tbs.issuer).unwrap_or_else(|| tbs.issuer.to_string()),
-            serial: to_hex(tbs.serial_number.as_bytes()).to_uppercase(),
-            not_before: unix_seconds(&tbs.validity.not_before),
-            not_after: unix_seconds(&tbs.validity.not_after),
+            subject: tbs.subject().to_string(),
+            subject_cn: common_name(tbs.subject()).unwrap_or_else(|| tbs.subject().to_string()),
+            issuer: tbs.issuer().to_string(),
+            issuer_cn: common_name(tbs.issuer()).unwrap_or_else(|| tbs.issuer().to_string()),
+            serial: to_hex(tbs.serial_number().as_bytes()).to_uppercase(),
+            not_before: unix_seconds(&tbs.validity().not_before),
+            not_after: unix_seconds(&tbs.validity().not_after),
             digital_signature: false,
             non_repudiation: false,
             key_usage_unrestricted: true,
             is_ca: false,
             qualified: false,
-            key_type: key_type(&tbs.subject_public_key_info.algorithm),
+            key_type: key_type(&tbs.subject_public_key_info().algorithm),
             sha1_fingerprint: to_hex(&DigestAlgorithm::Sha1.digest(der)).to_uppercase(),
             sha256_fingerprint: to_hex(&DigestAlgorithm::Sha256.digest(der)).to_uppercase(),
         };
 
-        for ext in tbs.extensions.iter().flatten() {
+        for ext in tbs.extensions().into_iter().flatten() {
             match ext.extn_id {
                 oid::KEY_USAGE => {
                     let usage = KeyUsage::from_der(ext.extn_value.as_bytes())
@@ -154,12 +154,10 @@ fn key_type(algorithm: &spki::AlgorithmIdentifierOwned) -> Option<KeyType> {
 
 /// Value of the last attribute of type `attr` in `name`, decoded as a string.
 pub(crate) fn name_attribute(name: &Name, attr: const_oid::ObjectIdentifier) -> Option<String> {
-    name.0
-        .iter()
-        .flat_map(|rdn| rdn.0.iter())
+    name.iter()
         .filter(|atv| atv.oid == attr)
         .filter_map(|atv| any_to_string(&atv.value))
-        .next_back()
+        .last()
 }
 
 fn common_name(name: &Name) -> Option<String> {
@@ -173,6 +171,7 @@ fn any_to_string(value: &Any) -> Option<String> {
             DirectoryString::PrintableString(s) => s.to_string(),
             DirectoryString::TeletexString(s) => s.to_string(),
             DirectoryString::Utf8String(s) => s,
+            DirectoryString::BmpString(s) => s.to_string(),
         });
     }
     value

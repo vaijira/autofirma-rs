@@ -21,24 +21,25 @@ serde.workspace = true
 serde_bytes.workspace = true
 thiserror.workspace = true
 
-# RustCrypto, aligned with the versions used by `underskrift` (cms 0.2 / der 0.7 generation).
+# RustCrypto, der 0.8 / x509-cert 0.3 generation (the same one p12-keystore uses).
+# `cms` 0.3 and `rsa` 0.10 are only available as pre-releases: pin them exactly, since
+# pre-releases may break between versions. `cms` must match the version `pkcs12` pins.
 base64ct = { version = "1", features = ["alloc"] }
-cms = "0.2"
-const-oid = { version = "0.9", features = ["db"] }
-der = { version = "0.7", features = ["alloc", "derive", "oid", "std"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
-pkcs8 = "0.10"
-rsa = "0.9"
-sha1 = { version = "0.10", features = ["oid"] }
-sha2 = { version = "0.10", features = ["oid"] }
-signature = "2"
-spki = "0.7"
-x509-cert = "0.2"
+cms = "=0.3.0-pre.1"
+const-oid = { version = "0.10", features = ["db"] }
+der = { version = "0.8", features = ["alloc", "derive", "oid", "std"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
+p384 = { version = "0.14", features = ["ecdsa"] }
+pkcs8 = "0.11"
+rsa = { version = "=0.10.0-rc.19", features = ["encoding"] }
+sha1 = { version = "0.11", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
+signature = "3"
+spki = "0.8"
+x509-cert = "0.3"
 zeroize = "1"
 
-# PKCS#12 (.p12 / .pfx) keystores. Uses the newer RustCrypto generation; keys cross into
-# the signing stack as PKCS#8 DER bytes.
+# PKCS#12 (.p12 / .pfx) keystores. `pbes1` adds the legacy RC2/3DES encryption.
 p12-keystore = { version = "0.4", features = ["pbes1"] }
 
 # XML canonicalization and transforms for XMLDSig / XAdES / FacturaE / ODF / OOXML.

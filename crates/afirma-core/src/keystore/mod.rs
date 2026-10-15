@@ -63,7 +63,8 @@ impl std::fmt::Debug for SoftKey {
 impl SoftKey {
     /// Builds a key from a PKCS#8 `PrivateKeyInfo` and its chain (DER, leaf first).
     pub fn from_pkcs8_der(alias: &str, pkcs8: &[u8], chain_der: &[&[u8]]) -> Result<Self> {
-        let info = pkcs8::PrivateKeyInfo::from_der(pkcs8).map_err(|e| Error::Key(e.to_string()))?;
+        let info =
+            pkcs8::PrivateKeyInfoRef::from_der(pkcs8).map_err(|e| Error::Key(e.to_string()))?;
         let key = match info.algorithm.oid {
             oid::RSA_ENCRYPTION => PrivateKey::Rsa(
                 RsaPrivateKey::from_pkcs8_der(pkcs8).map_err(|e| Error::Key(e.to_string()))?,

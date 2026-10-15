@@ -95,8 +95,8 @@ impl PreparedSignature {
         let signer_info = SignerInfo {
             version: CmsVersion::V1,
             sid: SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
-                issuer: leaf.tbs_certificate.issuer.clone(),
-                serial_number: leaf.tbs_certificate.serial_number.clone(),
+                issuer: leaf.tbs_certificate().issuer().clone(),
+                serial_number: leaf.tbs_certificate().serial_number().clone(),
             }),
             digest_alg: self.digest.algorithm_identifier(),
             signed_attrs: Some(self.signed_attributes),
@@ -299,7 +299,7 @@ fn embedded(signed_data: &SignedData) -> Result<Option<Vec<u8>>> {
         .as_ref()
         .map(|any| {
             any.decode_as::<OctetString>()
-                .map(|octets| octets.into_bytes())
+                .map(|octets| octets.into_bytes().into_vec())
                 .map_err(|e| Error::InvalidSignature(e.to_string()))
         })
         .transpose()
@@ -313,8 +313,8 @@ fn verify_signer(
     let digest = DigestAlgorithm::from_oid(&signer.digest_alg.oid);
     let certificate = match &signer.sid {
         SignerIdentifier::IssuerAndSerialNumber(id) => certificates.iter().copied().find(|cert| {
-            cert.tbs_certificate.issuer == id.issuer
-                && cert.tbs_certificate.serial_number == id.serial_number
+            *cert.tbs_certificate().issuer() == id.issuer
+                && *cert.tbs_certificate().serial_number() == id.serial_number
         }),
         SignerIdentifier::SubjectKeyIdentifier(_) => None,
     };
@@ -392,7 +392,7 @@ fn check_signature(
     message: &[u8],
     signature: &[u8],
 ) -> SignerStatus {
-    let spki = &certificate.tbs_certificate.subject_public_key_info;
+    let spki = certificate.tbs_certificate().subject_public_key_info();
     let Some(key_type) = CertificateInfo::from_certificate(certificate, &[])
         .ok()
         .and_then(|info| info.key_type)
@@ -406,7 +406,7 @@ fn check_signature(
         KeyType::Rsa => spki
             .to_der()
             .ok()
-            .and_then(|der| RsaPublicKey::from_public_key_der(&der).ok())
+            .and_then(|der| RsaPublicKey::from_public_key_der(der.as_ref()).ok())
             .is_some_and(|key| {
                 let padding = match digest {
                     DigestAlgorithm::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
@@ -478,9 +478,9 @@ fn signing_certificate_v2(cert: &Certificate, digest: DigestAlgorithm) -> Result
         cert_hash: OctetString::new(digest.digest(&cert_der))?,
         issuer_serial: Some(IssuerSerial {
             issuer: vec![GeneralName::DirectoryName(
-                cert.tbs_certificate.issuer.clone(),
+                cert.tbs_certificate().issuer().clone(),
             )],
-            serial_number: cert.tbs_certificate.serial_number.clone(),
+            serial_number: cert.tbs_certificate().serial_number().clone(),
         }),
     };
     attribute(

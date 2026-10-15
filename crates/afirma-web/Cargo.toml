@@ -19,8 +19,8 @@ console_error_panic_hook.workspace = true
 dominator = "0.5"
 futures = "0.3"
 futures-signals = "0.3"
-gloo-file = { version = "0.3", features = ["futures"] }
-gloo-utils = "0.2"
+gloo-file = { version = "0.4", features = ["futures"] }
+gloo-utils = "0.3"
 js-sys.workspace = true
 log.workspace = true
 serde-wasm-bindgen.workspace = true
