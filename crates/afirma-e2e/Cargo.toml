@@ -10,5 +10,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dev-dependencies]
-thirtyfour = "0.37"
+# Without default features: `manager` (webdriver auto-download) pulls in `zip` 8, which is
+# entirely yanked. The tests connect to an already running webdriver.
+thirtyfour = { version = "0.37", default-features = false, features = ["reqwest", "rustls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
