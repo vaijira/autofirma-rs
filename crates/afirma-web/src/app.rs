@@ -6,7 +6,7 @@ use wasm_bindgen::JsValue;
 
 use crate::{
     css::{HEADER_CLASS, MAIN_CLASS, NAV_LINK_ACTIVE_CLASS, NAV_LINK_CLASS},
-    pages::{self, certs::CertsPage, sign::SignPage},
+    pages::{self, certs::CertsPage, sign::SignPage, verify::VerifyPage},
     router::Route,
     state::Keys,
     worker::WorkerClient,
@@ -15,6 +15,7 @@ use crate::{
 #[derive(Debug)]
 pub struct App {
     sign_page: Rc<SignPage>,
+    verify_page: Rc<VerifyPage>,
     certs_page: Rc<CertsPage>,
 }
 
@@ -24,6 +25,7 @@ impl App {
         let keys = Rc::new(Keys::default());
         Ok(Rc::new(Self {
             sign_page: SignPage::new(worker.clone(), keys.clone()),
+            verify_page: VerifyPage::new(worker.clone()),
             certs_page: CertsPage::new(worker, keys),
         }))
     }
@@ -36,7 +38,7 @@ impl App {
                     .class(&*MAIN_CLASS)
                     .child_signal(Route::signal().map(move |route| Some(match route {
                         Route::Sign => SignPage::render(&this.sign_page),
-                        Route::Verify => pages::coming_soon(route.title(), "P2"),
+                        Route::Verify => VerifyPage::render(&this.verify_page),
                         Route::Certs => CertsPage::render(&this.certs_page),
                         Route::Batch => pages::coming_soon(route.title(), "P4"),
                     })))

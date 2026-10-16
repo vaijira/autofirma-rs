@@ -30,6 +30,23 @@ impl DigestAlgorithm {
         }
     }
 
+    /// Computes the digest of the concatenation of `parts`.
+    pub fn digest_parts(self, parts: &[&[u8]]) -> Vec<u8> {
+        fn run<D: Digest>(parts: &[&[u8]]) -> Vec<u8> {
+            let mut hasher = D::new();
+            for part in parts {
+                hasher.update(part);
+            }
+            hasher.finalize().to_vec()
+        }
+        match self {
+            DigestAlgorithm::Sha1 => run::<Sha1>(parts),
+            DigestAlgorithm::Sha256 => run::<Sha256>(parts),
+            DigestAlgorithm::Sha384 => run::<Sha384>(parts),
+            DigestAlgorithm::Sha512 => run::<Sha512>(parts),
+        }
+    }
+
     /// Name as used by AutoFirma (`SHA-256`, ...).
     pub fn name(self) -> &'static str {
         match self {

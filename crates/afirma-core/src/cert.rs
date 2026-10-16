@@ -154,10 +154,15 @@ fn key_type(algorithm: &spki::AlgorithmIdentifierOwned) -> Option<KeyType> {
 
 /// Value of the last attribute of type `attr` in `name`, decoded as a string.
 pub(crate) fn name_attribute(name: &Name, attr: const_oid::ObjectIdentifier) -> Option<String> {
+    name_attributes(name, attr).pop()
+}
+
+/// Values of every attribute of type `attr` in `name`, in encoding order.
+pub(crate) fn name_attributes(name: &Name, attr: const_oid::ObjectIdentifier) -> Vec<String> {
     name.iter()
         .filter(|atv| atv.oid == attr)
         .filter_map(|atv| any_to_string(&atv.value))
-        .last()
+        .collect()
 }
 
 fn common_name(name: &Name) -> Option<String> {

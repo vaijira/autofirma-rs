@@ -89,6 +89,16 @@ pub mod oid {
     pub const COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
     /// Organizational unit attribute.
     pub const ORGANIZATIONAL_UNIT: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.11");
+    /// Organization attribute.
+    pub const ORGANIZATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.10");
+    /// Surname attribute.
+    pub const SURNAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.4");
+    /// Title attribute.
+    pub const TITLE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.12");
+    /// Given name attribute.
+    pub const GIVEN_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.42");
+    /// Pseudonym attribute.
+    pub const PSEUDONYM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.65");
 }
 
 /// Kind of private key.

@@ -2,6 +2,7 @@ use dominator::{Dom, html};
 
 pub mod certs;
 pub mod sign;
+pub mod verify;
 
 /// Placeholder for views planned in later phases of PLAN.md.
 pub fn coming_soon(title: &str, phase: &str) -> Dom {

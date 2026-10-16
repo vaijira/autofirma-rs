@@ -45,6 +45,32 @@ pub enum Error {
     /// An explicit signature was verified without the signed data.
     #[error("la firma no contiene los datos firmados; seleccione también el fichero original")]
     MissingSignedData,
+    /// The PDF could not be read.
+    #[error("el PDF no es válido: {0}")]
+    InvalidPdf(String),
+    /// The PDF is encrypted and no password was given.
+    #[error("el PDF está protegido con contraseña")]
+    PdfPasswordRequired,
+    /// Wrong PDF password.
+    #[error("la contraseña del PDF no es correcta")]
+    WrongPdfPassword,
+    /// The PDF is certified and does not allow more signatures.
+    #[error("el PDF está certificado y no admite más firmas")]
+    PdfCertified,
+    /// The visible signature does not fit in any of the selected pages.
+    #[error("la posición de la firma visible no es válida: {0}")]
+    InvalidSignaturePosition(String),
+    /// The signature does not fit in the space reserved in the PDF.
+    #[error("la firma ocupa {needed} bytes y solo se reservaron {reserved}")]
+    SignatureTooLarge {
+        /// Size of the signature.
+        needed: usize,
+        /// Space reserved in the PDF.
+        reserved: usize,
+    },
+    /// Triphase signature protocol error.
+    #[error("{0}")]
+    Triphase(String),
     /// ASN.1 encoding error.
     #[error("error de codificación ASN.1: {0}")]
     Asn1(#[from] der::Error),

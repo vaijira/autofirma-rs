@@ -1,3 +1,4 @@
+pub mod http;
 pub mod web;
 
 /// Formats a byte count for display (`1,5 MB`).

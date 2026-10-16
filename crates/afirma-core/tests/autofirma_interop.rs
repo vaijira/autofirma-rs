@@ -1,7 +1,9 @@
-//! Cross-validation of autofirma-rs CAdES signatures with AutoFirma's own
-//! validator (`tools/AfirmaValidate.java`) and `openssl cms -verify`.
+//! Cross-validation of autofirma-rs signatures with AutoFirma's own validators
+//! (`tools/AfirmaValidate.java`), `openssl cms -verify` (CAdES), and poppler's
+//! `pdfsig` and `qpdf --check` (PAdES).
 //!
-//! Needs Java, OpenSSL and AutoFirma installed, so it is ignored by default:
+//! Needs Java, OpenSSL, poppler-utils, qpdf and AutoFirma installed, so it is
+//! ignored by default:
 //!
 //! ```sh
 //! cargo test -p afirma-core --test autofirma_interop -- --ignored
@@ -16,6 +18,7 @@ use afirma_core::{
     digest::DigestAlgorithm,
     format::SignatureFormat,
     keystore::load_pkcs12,
+    pades::{self, CertificationLevel, Font, PadesParams, Rect, SignaturePages, VisibleSignature},
     policy::PolicyPreset,
 };
 
@@ -103,6 +106,138 @@ fn autofirma_and_openssl_accept_our_signatures() {
                         failures.push(format!("OpenSSL rejected {name}:\n{output}"));
                     }
                 }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[test]
+#[ignore]
+fn autofirma_pdfsig_and_qpdf_accept_our_pdf_signatures() {
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("autofirma_interop_pades");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let visible = |pages| VisibleSignature {
+        pages,
+        rect: Rect {
+            llx: 72.0,
+            lly: 72.0,
+            urx: 272.0,
+            ury: 142.0,
+        },
+        text: None,
+        font: Font::default(),
+        image: None,
+        obfuscate: None,
+        mask: None,
+    };
+
+    let mut failures = Vec::new();
+    for keystore in ["rsa.p12", "ec.p12"] {
+        let p12 = std::fs::read(repo().join("tests/data/certs").join(keystore)).unwrap();
+        let key = &load_pkcs12(&p12, "1234").unwrap()[0];
+        let base = PadesParams::new(now());
+        let cases: Vec<(&str, &str, PadesParams)> = vec![
+            ("doc.pdf", "bes", base.clone()),
+            ("doc-xref.pdf", "xref-stream", base.clone()),
+            (
+                "doc.pdf",
+                "age",
+                PadesParams {
+                    policy: Some(PolicyPreset::Age19.policy(SignatureFormat::Pades)),
+                    reason: Some("Conformidad".to_string()),
+                    location: Some("Madrid".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "doc-xref.pdf",
+                "visible-all",
+                PadesParams {
+                    visible: Some(visible(SignaturePages::All)),
+                    ..base.clone()
+                },
+            ),
+            (
+                "doc.pdf",
+                "visible-append",
+                PadesParams {
+                    visible: Some(visible(SignaturePages::Append)),
+                    ..base.clone()
+                },
+            ),
+            (
+                "doc.pdf",
+                "certified",
+                PadesParams {
+                    certification: CertificationLevel::NoChanges,
+                    visible: Some(visible(SignaturePages::Last)),
+                    ..base.clone()
+                },
+            ),
+            (
+                "doc-aes256.pdf",
+                "aes256",
+                PadesParams {
+                    password: Some("user".to_string()),
+                    ..base.clone()
+                },
+            ),
+            ("doc-rc4.pdf", "rc4", base.clone()),
+        ];
+        for (input, variant, params) in cases {
+            let name = format!("{keystore}-{variant}.pdf");
+            let pdf = std::fs::read(repo().join("tests/data/pades").join(input)).unwrap();
+            let signed = pades::sign(&pdf, key, &params).unwrap();
+            // A second signature on top, as co-signing a PDF does.
+            let signed = if variant == "bes" {
+                pades::sign(&signed, key, &base).unwrap()
+            } else {
+                signed
+            };
+            let path = out_dir.join(&name);
+            std::fs::write(&path, &signed).unwrap();
+            let password = params.password.as_deref();
+
+            let mut java = Command::new("java");
+            java.arg("-cp")
+                .arg(autofirma_jar())
+                .arg(repo().join("tools/AfirmaValidate.java"))
+                .arg(&path);
+            if let Some(password) = password {
+                java.arg(password);
+            }
+            let (ok, output) = run(&mut java);
+            if !ok {
+                failures.push(format!("AutoFirma rejected {name}:\n{output}"));
+            }
+
+            let mut pdfsig = Command::new("pdfsig");
+            if let Some(password) = password {
+                pdfsig.args(["-upw", password]);
+            }
+            let (_, output) = run(pdfsig.arg(&path));
+            let signatures = output.matches("Signature Field Name").count();
+            let valid = output.matches("Signature is Valid.").count();
+            if signatures == 0 || valid != signatures || !output.contains("Total document signed") {
+                failures.push(format!("pdfsig rejected {name}:\n{output}"));
+            }
+
+            let mut qpdf = Command::new("qpdf");
+            qpdf.arg("--check");
+            if let Some(password) = password {
+                qpdf.arg(format!("--password={password}"));
+            }
+            let (ok, output) = run(qpdf.arg(&path));
+            if !ok || !output.contains("No syntax or stream encoding errors") {
+                failures.push(format!("qpdf rejected {name}:\n{output}"));
             }
         }
     }

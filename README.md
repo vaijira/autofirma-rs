@@ -36,17 +36,30 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --target wasm32-unknown-unknown -p afirma-core -p afirma-web -p afirma-worker -- -D warnings
 ```
 
-Cross-validation with AutoFirma itself: this signs with every key, digest, mode and
-policy combination, then checks the results with AutoFirma's validator
-([tools/AfirmaValidate.java](tools/AfirmaValidate.java)) and `openssl cms -verify`. It needs
-Java, OpenSSL and AutoFirma installed:
+Cross-validation with AutoFirma itself: this signs CAdES with every key, digest, mode and
+policy combination and PAdES with every PDF variant (xref streams, encryption, visible,
+certified, co-signed), then checks the results with AutoFirma's validators
+([tools/AfirmaValidate.java](tools/AfirmaValidate.java)), `openssl cms -verify`, poppler's
+`pdfsig` and `qpdf --check`. It needs Java, OpenSSL, poppler-utils, qpdf and AutoFirma installed:
 
 ```sh
 cargo test -p afirma-core --test autofirma_interop -- --ignored
 ```
 
+Triphase signing is tested against the pre/post processors of clienteafirma's
+`afirma-server-triphase-signer`. [tools/triphase-server/run.sh](tools/triphase-server/run.sh)
+downloads them (pinned to AutoFirma 1.9), compiles them against `autofirma.jar` with a small
+HTTP wrapper and serves them on port 8090. It needs a JDK:
+
+```sh
+tools/triphase-server/run.sh &
+cargo test -p afirma-core --test triphase_interop -- --ignored
+```
+
 Test keystores live in `tests/data/certs` (password `1234`; regenerate them with `generate.sh`).
-Reference signatures made by AutoFirma live in `tests/data/cades`.
+Test PDFs live in `tests/data/pades` (regenerate them with `generate.sh`; the encrypted ones use
+the passwords `user` and `owner`). Reference signatures made by AutoFirma live in `tests/data/cades`
+and `tests/data/pades/autofirma-*.pdf`.
 
 The end-to-end tests need a built `dist/`. To run them with Selenium in Docker:
 
@@ -62,6 +75,9 @@ python3 -m http.server 8080 --directory dist &
 geckodriver --port 4444 &
 E2E_BROWSER=firefox E2E_TEST_DATA=$PWD/tests/data cargo test -p afirma-e2e -- --ignored --test-threads=1
 ```
+
+Set `TRIPHASE_URL=http://127.0.0.1:8090/afirma-server-triphase-signer/SignatureService` with the
+triphase test server running to also test triphase signing from the browser.
 
 ## License
 

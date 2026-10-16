@@ -49,10 +49,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses advisories
-          # Check the shipped (default) feature set. The action defaults to `--all-features`,
-          # which enables afirma-core's optional `pades` feature: underskrift -> tsp-ltv ->
-          # reqwest -> rustls pulls in Apache-2.0 crates (aws-lc-sys, ring, webpki-roots...)
-          # that are not GPL-2.0-compatible. Revisit when `pades` is enabled (PLAN.md §4.1).
+          # Check the shipped (default) feature set; the action defaults to `--all-features`.
           arguments: --workspace
 
   build:

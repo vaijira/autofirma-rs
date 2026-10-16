@@ -19,6 +19,10 @@ pub mod error;
 pub mod format;
 pub mod job;
 pub mod keystore;
+pub mod pades;
+pub mod params;
 pub mod policy;
+pub mod triphase;
+pub mod validation;
 
 pub use error::{Error, Result};

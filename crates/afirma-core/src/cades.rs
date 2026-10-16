@@ -72,7 +72,7 @@ pub struct CadesParams {
 }
 
 /// A signature whose signed attributes are ready to be signed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedSignature {
     signed_attributes: SignedAttributes,
     to_be_signed: Vec<u8>,
@@ -133,6 +133,37 @@ impl PreparedSignature {
         };
         Ok(content_info.to_der()?)
     }
+
+    /// Upper bound of the DER size of the finished signature, used to reserve
+    /// space for it before signing (PAdES).
+    pub fn max_encoded_len(&self) -> Result<usize> {
+        let leaf = &self.chain[0];
+        let signature_len = match self.key_type {
+            // Modulus size; the public key BIT STRING has a few bytes of overhead.
+            KeyType::Rsa => leaf
+                .tbs_certificate()
+                .subject_public_key_info()
+                .subject_public_key
+                .raw_bytes()
+                .len(),
+            // DER `ECDSA-Sig-Value` with two maximum length INTEGERs.
+            KeyType::EcP256 => 72,
+            KeyType::EcP384 => 104,
+        };
+        Ok(self.clone().finish(&vec![0xff; signature_len])?.len())
+    }
+}
+
+/// Signed attributes to include, besides `contentType`, `messageDigest` and
+/// `signingCertificateV2`, which are always present.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AttributeOptions<'a> {
+    /// `signingTime`, seconds since the Unix epoch.
+    pub signing_time: Option<i64>,
+    /// `contentHint` description.
+    pub content_description: Option<&'a str>,
+    /// `signaturePolicyIdentifier` (EPES).
+    pub policy: Option<&'a SignaturePolicy>,
 }
 
 /// First phase of a signature: builds the signed attributes for `data`.
@@ -147,27 +178,52 @@ pub fn prepare(
     if data.is_empty() {
         return Err(Error::EmptyData);
     }
+    prepare_digest(
+        &params.digest.digest(data),
+        (params.mode == SignatureMode::Implicit).then(|| data.to_vec()),
+        chain,
+        key_type,
+        params.digest,
+        AttributeOptions {
+            signing_time: Some(params.signing_time),
+            content_description: params.content_description.as_deref(),
+            policy: params.policy.as_ref(),
+        },
+    )
+}
+
+/// Builds the signed attributes for content whose `digest` is `message_digest`.
+/// `content` is embedded in the signature when present (implicit mode).
+pub(crate) fn prepare_digest(
+    message_digest: &[u8],
+    content: Option<Vec<u8>>,
+    chain: &[Certificate],
+    key_type: KeyType,
+    digest: DigestAlgorithm,
+    options: AttributeOptions<'_>,
+) -> Result<PreparedSignature> {
     let leaf = chain
         .first()
         .ok_or_else(|| Error::Certificate("falta el certificado del firmante".to_string()))?;
-    let digest = params.digest;
 
     let mut attributes = vec![
         attribute(oid::CONTENT_TYPE, &oid::DATA)?,
-        signing_time_attribute(params.signing_time)?,
-        attribute(oid::MESSAGE_DIGEST, &OctetString::new(digest.digest(data))?)?,
+        attribute(oid::MESSAGE_DIGEST, &OctetString::new(message_digest)?)?,
         signing_certificate_v2(leaf, digest)?,
     ];
-    if let Some(description) = &params.content_description {
+    if let Some(signing_time) = options.signing_time {
+        attributes.push(signing_time_attribute(signing_time)?);
+    }
+    if let Some(description) = options.content_description {
         attributes.push(attribute(
             oid::CONTENT_HINT,
             &ContentHints {
-                content_description: Some(description.clone()),
+                content_description: Some(description.to_string()),
                 content_type: oid::DATA,
             },
         )?);
     }
-    if let Some(policy) = &params.policy {
+    if let Some(policy) = options.policy {
         attributes.push(signature_policy(policy)?);
     }
 
@@ -180,7 +236,7 @@ pub fn prepare(
         to_be_signed,
         digest,
         key_type,
-        content: (params.mode == SignatureMode::Implicit).then(|| data.to_vec()),
+        content,
         chain: chain.to_vec(),
     })
 }

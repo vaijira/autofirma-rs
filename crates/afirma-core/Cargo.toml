@@ -8,13 +8,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-default = []
-# PAdES through `underskrift`. Off by default: underskrift 0.1.4 unconditionally depends on
-# `tsp-ltv` (blocking reqwest), which does not build for wasm32-unknown-unknown. Enable it
-# once the upstream fix lands (see PLAN.md §4.1).
-pades = ["dep:underskrift"]
-
 [dependencies]
 log.workspace = true
 serde.workspace = true
@@ -47,10 +40,14 @@ bergshamra-c14n = "0.10"
 bergshamra-transforms = { version = "0.10", default-features = false, features = ["rustcrypto"] }
 bergshamra-xml = "0.10"
 
-# PDF signing (PAdES).
-underskrift = { version = "0.1", default-features = false, features = ["visual"], optional = true }
+# PAdES: lopdf parses the document (MIT, same RustCrypto generation as the crates above);
+# the incremental update, appearance and CMS are ours. flate2 and png encode rubric images.
+flate2 = "1"
+lopdf = { version = "0.45", default-features = false }
+png = "0.18"
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # Route every `getrandom` generation to `crypto.getRandomValues`.
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+lopdf = { version = "0.45", default-features = false, features = ["wasm_js"] }

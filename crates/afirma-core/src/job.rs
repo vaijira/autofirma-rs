@@ -18,7 +18,10 @@ use crate::{
     digest::{DigestAlgorithm, to_hex},
     error::{Error, Result},
     format::{DataKind, SignatureFormat},
-    keystore::{SoftKey, load_pkcs12},
+    keystore::{SigningKey, SoftKey, load_pkcs12},
+    pades::{self, PadesParams, PdfInfo},
+    triphase::{self, TriphaseData},
+    validation::{self, Verification},
 };
 
 /// Message sent from the UI to the worker.
@@ -84,6 +87,46 @@ pub enum Job {
         /// Signature parameters.
         params: CadesParams,
     },
+    /// Read the pages, encryption and signatures of a PDF.
+    PdfInfo {
+        /// PDF contents.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Password of an encrypted PDF.
+        password: Option<String>,
+    },
+    /// Sign a PDF (PAdES).
+    SignPades {
+        /// PDF contents.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+        /// Signature parameters.
+        params: Box<PadesParams>,
+    },
+    /// Sign the pre-signatures of a triphase session.
+    SignTriphase {
+        /// Body of the server's response to the pre-sign request. Parsed here, so
+        /// the UI does not need an XML parser.
+        #[serde(with = "serde_bytes")]
+        presign_response: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+        /// Digest algorithm.
+        digest: DigestAlgorithm,
+    },
+    /// Verify a signature (CAdES or PDF).
+    Verify {
+        /// Signature, or signed PDF.
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+        /// Signed data of an explicit (detached) CAdES signature.
+        #[serde(with = "serde_bytes", default)]
+        data: Option<Vec<u8>>,
+        /// Password of an encrypted PDF.
+        password: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for Job {
@@ -94,6 +137,10 @@ impl std::fmt::Debug for Job {
             Job::LoadPkcs12 { .. } => "LoadPkcs12",
             Job::RemoveKey { .. } => "RemoveKey",
             Job::SignCades { .. } => "SignCades",
+            Job::PdfInfo { .. } => "PdfInfo",
+            Job::SignPades { .. } => "SignPades",
+            Job::SignTriphase { .. } => "SignTriphase",
+            Job::Verify { .. } => "Verify",
         };
         f.write_str(name)
     }
@@ -108,8 +155,14 @@ pub enum JobOutput {
     Keys(Vec<KeyEntry>),
     /// The job finished without output.
     Done,
-    /// A signature.
+    /// A signature, or a signed document.
     Signature(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// Output of [`Job::PdfInfo`].
+    PdfInfo(PdfInfo),
+    /// Output of [`Job::SignTriphase`]: the session with the signatures.
+    Triphase(TriphaseData),
+    /// Output of [`Job::Verify`].
+    Verification(Verification),
 }
 
 /// Information about a loaded file.
@@ -134,6 +187,8 @@ pub struct KeyEntry {
     pub alias: String,
     /// Signer certificate.
     pub certificate: CertificateInfo,
+    /// Certificate chain (DER), leaf first. Needed for triphase signatures.
+    pub chain: Vec<serde_bytes::ByteBuf>,
 }
 
 /// Runs jobs and keeps the loaded private keys.
@@ -172,6 +227,13 @@ impl Engine {
                             id: self.next_key_id,
                             alias: key.alias().to_string(),
                             certificate: key.certificate_info()?,
+                            chain: key
+                                .certificate_chain()
+                                .iter()
+                                .map(|cert| {
+                                    crate::cert::to_der(cert).map(serde_bytes::ByteBuf::from)
+                                })
+                                .collect::<Result<_>>()?,
                         };
                         self.keys.insert(entry.id, key);
                         Ok(entry)
@@ -191,6 +253,33 @@ impl Engine {
                 let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
                 cades::sign(&data, key, &params).map(JobOutput::Signature)
             }
+            Job::PdfInfo { data, password } => {
+                pades::info(&data, password.as_deref()).map(JobOutput::PdfInfo)
+            }
+            Job::SignPades {
+                data,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                pades::sign(&data, key, &params).map(JobOutput::Signature)
+            }
+            Job::SignTriphase {
+                presign_response,
+                key_id,
+                digest,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                let mut session = triphase::parse_presign_response(&presign_response)?;
+                session.sign(key, digest)?;
+                Ok(JobOutput::Triphase(session))
+            }
+            Job::Verify {
+                signature,
+                data,
+                password,
+            } => validation::verify(&signature, data.as_deref(), password.as_deref())
+                .map(JobOutput::Verification),
         }
     }
 }
@@ -287,5 +376,59 @@ mod tests {
             JobOutput::Done
         );
         assert!(matches!(sign(&mut engine), Err(Error::KeyNotFound)));
+    }
+
+    #[test]
+    fn pdf_jobs() {
+        let read = |path: &str| {
+            std::fs::read(format!(
+                "{}/../../tests/data/{path}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        let mut engine = Engine::new();
+        let Ok(JobOutput::Keys(keys)) = engine.run(Job::LoadPkcs12 {
+            data: read("certs/ec.p12"),
+            password: "1234".to_string(),
+        }) else {
+            panic!("keystore not loaded");
+        };
+        assert_eq!(keys[0].chain.len(), 2);
+
+        let pdf = read("pades/doc-aes256.pdf");
+        assert!(matches!(
+            engine.run(Job::PdfInfo {
+                data: pdf.clone(),
+                password: None
+            }),
+            Err(Error::PdfPasswordRequired)
+        ));
+        let Ok(JobOutput::PdfInfo(info)) = engine.run(Job::PdfInfo {
+            data: pdf.clone(),
+            password: Some("user".to_string()),
+        }) else {
+            panic!("no info");
+        };
+        assert_eq!(info.pages.len(), 1);
+
+        let Ok(JobOutput::Signature(signed)) = engine.run(Job::SignPades {
+            data: pdf,
+            key_id: keys[0].id,
+            params: Box::new(PadesParams {
+                password: Some("user".to_string()),
+                ..PadesParams::new(1_792_159_674)
+            }),
+        }) else {
+            panic!("not signed");
+        };
+        let Ok(JobOutput::Verification(verification)) = engine.run(Job::Verify {
+            signature: signed,
+            data: None,
+            password: Some("user".to_string()),
+        }) else {
+            panic!("not verified");
+        };
+        assert!(verification.is_valid());
     }
 }
