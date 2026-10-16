@@ -5,8 +5,6 @@ WebAssembly with [dominator](https://github.com/Pauan/rust-dominator). It is a p
 current features of the Spanish government's [AutoFirma](https://github.com/ctt-gob-es/clienteafirma)
 client. Files never leave the user's machine.
 
-See [PLAN.md](PLAN.md) for the migration plan and roadmap.
-
 ## Layout
 
 | Path | Contents |

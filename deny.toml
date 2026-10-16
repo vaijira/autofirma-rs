@@ -21,8 +21,6 @@ exceptions = [
   # Apache-2.0 only. Required by RustCrypto `der` 0.7 (cms, x509-cert, spki, pkcs8...),
   # so it is shipped in the wasm bundle. Pending license decision, see PLAN.md §6.
   { allow = ["Apache-2.0"], crate = "flagset" },
-  # Apache-2.0 only. Only used by the e2e test tooling (thirtyfour -> reqwest), never shipped.
-  { allow = ["Apache-2.0"], crate = "sync_wrapper" },
 ]
 
 [advisories]
