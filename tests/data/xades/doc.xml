@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<documento xmlns="urn:autofirma-rs:prueba" id="d1">
+  <titulo>Documento de prueba</titulo>
+  <texto>Hola autofirma-rs, señor.</texto>
+</documento>

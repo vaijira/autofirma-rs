@@ -110,6 +110,65 @@ impl DataKind {
     }
 }
 
+/// MIME type of `data` for the `MimeType` of XAdES signatures, like AutoFirma's
+/// `MimeHelper` for the formats it tells apart; `application/octet-stream` otherwise.
+pub fn mime_type(data: &[u8]) -> String {
+    const MAGIC: [(&[u8], &str); 6] = [
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"II*\x00", "image/tiff"),
+        (b"MM\x00*", "image/tiff"),
+    ];
+    if let Some((_, mime)) = MAGIC.iter().find(|(magic, _)| data.starts_with(magic)) {
+        return mime.to_string();
+    }
+    let kind = DataKind::detect(data);
+    if kind == DataKind::Odf {
+        // Uncompressed `mimetype` entry: its contents follow the 38 byte header and name.
+        let content = data.get(38..).unwrap_or_default();
+        let end = find(content, b"PK\x03\x04").unwrap_or(content.len().min(128));
+        if let Ok(mime) = std::str::from_utf8(&content[..end])
+            && mime.starts_with("application/vnd.oasis.opendocument")
+        {
+            return mime.to_string();
+        }
+    }
+    match kind {
+        DataKind::Pdf => "application/pdf",
+        DataKind::Xml => "text/xml",
+        DataKind::Text => "text/plain",
+        DataKind::Zip | DataKind::Ooxml | DataKind::Odf => "application/zip",
+        DataKind::CmsSignedData => "application/pkcs7-signature",
+        DataKind::Binary => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// OID AutoFirma associates with a MIME type (its `mimetypes_oids.properties`),
+/// written in the XAdES `DataObjectFormat`.
+pub fn mime_type_oid(mime_type: &str) -> Option<&'static str> {
+    Some(match mime_type {
+        "application/pdf" => "1.2.840.10003.5.109.1",
+        "application/postscript" => "1.2.840.10003.5.109.2",
+        "text/html" => "1.2.840.10003.5.109.3",
+        "image/tiff" => "1.2.840.10003.5.109.4",
+        "image/gif" => "1.2.840.10003.5.109.5",
+        "image/jpeg" => "1.2.840.10003.5.109.6",
+        "image/png" => "1.2.840.10003.5.109.7",
+        "video/mpeg" => "1.2.840.10003.5.109.8",
+        "text/sgml" => "1.2.840.10003.5.109.9",
+        "text/xml" => "1.2.840.10003.5.109.10",
+        "application/msword" => "1.2.840.113556.4.2",
+        "application/vnd.ms-excel" => "1.2.840.113556.4.3",
+        "application/vnd.ms-project" => "1.2.840.113556.4.4",
+        "application/vnd.ms-powerpoint" => "1.2.840.113556.4.5",
+        "application/vnd.ms-works" => "1.2.840.113556.4.6",
+        _ => return None,
+    })
+}
+
 fn head(data: &[u8], len: usize) -> &[u8] {
     &data[..data.len().min(len)]
 }

@@ -35,10 +35,19 @@ zeroize = "1"
 # PKCS#12 (.p12 / .pfx) keystores. `pbes1` adds the legacy RC2/3DES encryption.
 p12-keystore = { version = "0.4", features = ["pbes1"] }
 
-# XML canonicalization and transforms for XMLDSig / XAdES / FacturaE / ODF / OOXML.
+# XML canonicalization for XMLDSig / XAdES / FacturaE / ODF / OOXML. The transforms
+# (enveloped, Base64, XPath) are ours: `bergshamra-transforms` pulls a second RustCrypto
+# generation (der 0.7, with the Apache-2.0-only `flagset`) and blocking HTTP (`tsp-ltv`).
 bergshamra-c14n = "0.10"
-bergshamra-transforms = { version = "0.10", default-features = false, features = ["rustcrypto"] }
 bergshamra-xml = "0.10"
+# XML documents in encodings other than UTF-8 (ISO-8859-1...). Already used by lopdf.
+encoding_rs = "0.8"
+
+# ASiC-S containers (and, in P4, ODF / OOXML packages).
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+
+# Random ids of XAdES elements and nonces of timestamp requests.
+getrandom = "0.4"
 
 # PAdES: lopdf parses the document (MIT, same RustCrypto generation as the crates above);
 # the incremental update, appearance and CMS are ours. flate2 and png encode rubric images.
@@ -49,5 +58,5 @@ png = "0.18"
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # Route every `getrandom` generation to `crypto.getRandomValues`.
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
-getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 lopdf = { version = "0.45", default-features = false, features = ["wasm_js"] }

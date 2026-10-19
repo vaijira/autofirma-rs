@@ -99,6 +99,29 @@ pub mod oid {
     pub const GIVEN_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.42");
     /// Pseudonym attribute.
     pub const PSEUDONYM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.65");
+    /// Country attribute.
+    pub const COUNTRY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.6");
+    /// Locality attribute.
+    pub const LOCALITY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.7");
+    /// State or province attribute.
+    pub const STATE_OR_PROVINCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.8");
+    /// Street attribute.
+    pub const STREET: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.9");
+    /// Domain component attribute.
+    pub const DOMAIN_COMPONENT: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.25");
+    /// User id attribute.
+    pub const USER_ID: ObjectIdentifier = ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.1");
+
+    /// id-ct-TSTInfo content type (RFC 3161).
+    pub const TST_INFO: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
+    /// id-aa-signatureTimeStampToken unsigned attribute (RFC 3161, CAdES-T).
+    pub const SIGNATURE_TIMESTAMP_TOKEN: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
+    /// id-kp-timeStamping extended key usage.
+    pub const KP_TIME_STAMPING: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
 }
 
 /// Kind of private key.

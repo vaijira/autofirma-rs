@@ -5,8 +5,9 @@ use afirma_core::{
     algorithm::KeyType,
     cades::{CadesParams, SignatureMode},
     digest::DigestAlgorithm,
+    facturae::{FacturaeParams, FacturaeRole},
     format::{DataKind, SignatureFormat},
-    job::{FileAnalysis, Job, JobOutput, KeyEntry},
+    job::{AsicSignature, FileAnalysis, Job, JobOutput, KeyEntry},
     pades::{
         CertificationLevel, Font, FontFamily, PadesParams, PdfInfo, SignaturePages,
         VisibleSignature,
@@ -14,6 +15,7 @@ use afirma_core::{
     params::ExtraParams,
     policy::PolicyPreset,
     triphase::{self, CryptoOperation, TriphaseFormat, TriphaseRequest},
+    xades::{ProductionPlace, XadesFormat, XadesParams},
 };
 use anyhow::anyhow;
 use dominator::{Dom, clone, events, html, link, with_node};
@@ -60,6 +62,17 @@ struct SignatureResult {
     description: String,
 }
 
+/// Timestamps of a PDF (AutoFirma's `tsType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfTimestamp {
+    /// On the signature (`1`).
+    Signature,
+    /// On the whole document, as a new revision (`2`).
+    Document,
+    /// Both (`3`).
+    Both,
+}
+
 /// Signature options, with AutoFirma's defaults.
 #[derive(Debug)]
 struct Options {
@@ -78,6 +91,16 @@ struct Options {
     rubric: Mutable<Option<Rc<LoadedFile>>>,
     triphase: Mutable<bool>,
     server_url: Mutable<String>,
+    /// XAdES enveloping, enveloped or detached.
+    xades_format: Mutable<XadesFormat>,
+    /// CAdES or XAdES signature inside an ASiC-S container.
+    asic: Mutable<bool>,
+    /// Role of the signer of a FacturaE invoice.
+    role: Mutable<FacturaeRole>,
+    timestamp: Mutable<bool>,
+    tsa_url: Mutable<String>,
+    tsa_policy: Mutable<String>,
+    pdf_timestamp: Mutable<PdfTimestamp>,
 }
 
 /// "Firmar" view: pick a file, choose the options and sign it.
@@ -118,6 +141,13 @@ impl SignPage {
                 rubric: Mutable::new(None),
                 triphase: Mutable::new(false),
                 server_url: Mutable::new(String::new()),
+                xades_format: Mutable::new(XadesFormat::Enveloping),
+                asic: Mutable::new(false),
+                role: Mutable::new(FacturaeRole::Issuer),
+                timestamp: Mutable::new(false),
+                tsa_url: Mutable::new(String::new()),
+                tsa_policy: Mutable::new(String::new()),
+                pdf_timestamp: Mutable::new(PdfTimestamp::Signature),
             },
             signature: Mutable::new(None),
             busy: Mutable::new(None),
@@ -145,9 +175,12 @@ impl SignPage {
                 Ok(JobOutput::Analysis(analysis)) => {
                     let is_pdf = analysis.kind == DataKind::Pdf;
                     this.options.format.set(match analysis.default_format {
-                        SignatureFormat::Pades => SignatureFormat::Pades,
+                        format @ (SignatureFormat::Pades | SignatureFormat::Xades | SignatureFormat::Facturae) => format,
                         _ => SignatureFormat::Cades,
                     });
+                    if analysis.kind != DataKind::Xml && this.options.xades_format.get() == XadesFormat::Enveloped {
+                        this.options.xades_format.set(XadesFormat::Enveloping);
+                    }
                     this.selected.set(Some(Rc::new(Selected { file, analysis })));
                     if is_pdf {
                         Self::open_pdf(&this, None).await;
@@ -233,7 +266,44 @@ impl SignPage {
             visible,
             password: pdf.password.clone(),
             allow_signing_certified: false,
-            reserved_size: None,
+            // Room for the signature timestamp, added to the CMS afterwards.
+            reserved_size: (options.timestamp.get()
+                && options.pdf_timestamp.get() != PdfTimestamp::Document)
+                .then_some(32 * 1024),
+        }
+    }
+
+    fn production_place(&self) -> ProductionPlace {
+        let city = self.options.location.get_cloned();
+        ProductionPlace {
+            city: (!city.trim().is_empty()).then(|| city.trim().to_string()),
+            ..ProductionPlace::default()
+        }
+    }
+
+    fn xades_params(&self) -> XadesParams {
+        XadesParams {
+            digest: self.options.digest.get(),
+            format: self.options.xades_format.get(),
+            policy: self
+                .options
+                .policy
+                .get()
+                .map(|preset| preset.policy(SignatureFormat::Xades)),
+            signing_time: now(),
+            utc_offset_minutes: utc_offset_minutes(),
+            production_place: self.production_place(),
+            claimed_roles: Vec::new(),
+        }
+    }
+
+    fn facturae_params(&self) -> FacturaeParams {
+        FacturaeParams {
+            digest: self.options.digest.get(),
+            signing_time: now(),
+            utc_offset_minutes: utc_offset_minutes(),
+            role: self.options.role.get(),
+            production_place: self.production_place(),
         }
     }
 
@@ -283,6 +353,66 @@ impl SignPage {
                     })
                 }
                 (SignatureFormat::Pades, None) => Err(anyhow!("Abra antes el PDF")),
+                (SignatureFormat::Facturae, _) => {
+                    let params = this.facturae_params();
+                    if this.options.triphase.get() {
+                        let extra = ExtraParams::from(&params);
+                        Self::sign_triphase(&this, &entry, TriphaseFormat::Facturae, &selected.file.data, params.digest, extra).await
+                    } else {
+                        let job = Job::SignFacturae { data: selected.file.data.clone(), key_id: entry.id, params };
+                        Self::run_signature_job(&this, job).await
+                    }
+                    .map(|data| SignatureResult {
+                        description: format!("Factura electrónica firmada ({}).", format_size(data.len())),
+                        data,
+                        file_name: format!("{}.xsig", selected.file.name),
+                        mime_type: "text/xml",
+                    })
+                }
+                (format, _) if this.options.asic.get() => {
+                    let signature = if format == SignatureFormat::Xades {
+                        AsicSignature::Xades(this.xades_params())
+                    } else {
+                        AsicSignature::Cades(this.cades_params(selected.analysis.kind))
+                    };
+                    if this.options.triphase.get() {
+                        Err(anyhow!("Los contenedores ASiC-S no se pueden firmar en un servidor trifásico"))
+                    } else {
+                        let job = Job::SignAsic {
+                            data: selected.file.data.clone(),
+                            file_name: Some(selected.file.name.clone()),
+                            key_id: entry.id,
+                            params: Box::new(signature),
+                        };
+                        Self::run_signature_job(&this, job).await
+                    }
+                    .map(|data| SignatureResult {
+                        description: format!(
+                            "Contenedor ASiC-S con firma {} generado ({}).",
+                            format.name(),
+                            format_size(data.len())
+                        ),
+                        data,
+                        file_name: format!("{}.asics", selected.file.name),
+                        mime_type: "application/vnd.etsi.asic-s+zip",
+                    })
+                }
+                (SignatureFormat::Xades, _) => {
+                    let params = this.xades_params();
+                    if this.options.triphase.get() {
+                        let extra = ExtraParams::from(&params);
+                        Self::sign_triphase(&this, &entry, TriphaseFormat::Xades, &selected.file.data, params.digest, extra).await
+                    } else {
+                        let job = Job::SignXades { data: selected.file.data.clone(), key_id: entry.id, params: Box::new(params) };
+                        Self::run_signature_job(&this, job).await
+                    }
+                    .map(|data| SignatureResult {
+                        description: format!("Firma XAdES generada ({}).", format_size(data.len())),
+                        data,
+                        file_name: format!("{}.xsig", selected.file.name),
+                        mime_type: "text/xml",
+                    })
+                }
                 _ => {
                     let params = this.cades_params(selected.analysis.kind);
                     if this.options.triphase.get() {
@@ -300,12 +430,110 @@ impl SignPage {
                     })
                 }
             };
+            let result = match result {
+                Ok(signature) if this.options.timestamp.get() => {
+                    Self::add_timestamps(&this, signature, format, pdf.as_deref()).await
+                }
+                other => other,
+            };
             match result {
                 Ok(signature) => this.signature.set(Some(Rc::new(signature))),
                 Err(err) => this.error.set(Some(err.to_string())),
             }
             this.busy.set(None);
         }));
+    }
+
+    /// Adds timestamps from the TSA to a new signature: signature timestamps
+    /// and, for PDFs, a document timestamp if requested.
+    async fn add_timestamps(
+        this: &Rc<Self>,
+        mut signature: SignatureResult,
+        format: SignatureFormat,
+        pdf: Option<&PdfDocument>,
+    ) -> anyhow::Result<SignatureResult> {
+        let url = this.options.tsa_url.get_cloned().trim().to_string();
+        if url.is_empty() {
+            return Err(anyhow!(
+                "Indique la dirección del servidor de sellado de tiempo (TSA)"
+            ));
+        }
+        let policy = Some(this.options.tsa_policy.get_cloned().trim().to_string())
+            .filter(|policy| !policy.is_empty());
+        let digest = this.options.digest.get();
+        let kind = if format == SignatureFormat::Pades {
+            this.options.pdf_timestamp.get()
+        } else {
+            PdfTimestamp::Signature
+        };
+
+        this.busy.set(Some("Obteniendo el sello de tiempo…"));
+        if kind != PdfTimestamp::Document {
+            let requests = match this
+                .worker
+                .run(Job::TimestampRequests {
+                    signed: signature.data.clone(),
+                    digest,
+                    policy: policy.clone(),
+                })
+                .await?
+            {
+                JobOutput::TimestampRequests(requests) => requests,
+                other => return Err(anyhow!("Respuesta inesperada del worker: {other:?}")),
+            };
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in &requests {
+                responses.push(serde_bytes::ByteBuf::from(
+                    http::post_timestamp_query(&url, request).await?,
+                ));
+            }
+            signature.data = Self::run_signature_job(
+                this,
+                Job::AddTimestamps {
+                    signed: signature.data,
+                    digest,
+                    responses,
+                },
+            )
+            .await?;
+        }
+        if kind != PdfTimestamp::Signature {
+            let (prepared, request) = match this
+                .worker
+                .run(Job::PrepareDocumentTimestamp {
+                    pdf: signature.data,
+                    password: pdf.and_then(|pdf| pdf.password.clone()),
+                    digest,
+                    policy,
+                })
+                .await?
+            {
+                JobOutput::DocumentTimestamp { prepared, request } => (prepared, request),
+                other => return Err(anyhow!("Respuesta inesperada del worker: {other:?}")),
+            };
+            let response = http::post_timestamp_query(&url, &request).await?;
+            signature.data = Self::run_signature_job(
+                this,
+                Job::AddDocumentTimestamp {
+                    prepared,
+                    digest,
+                    response,
+                },
+            )
+            .await?;
+        }
+        // "Firma XAdES generada (5 KB)." → "Firma XAdES generada con sello de tiempo (9 KB)."
+        let what = signature
+            .description
+            .split(" (")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        signature.description = format!(
+            "{what} con sello de tiempo ({}).",
+            format_size(signature.data.len())
+        );
+        Ok(signature)
     }
 
     async fn run_signature_job(this: &Rc<Self>, job: Job) -> anyhow::Result<Vec<u8>> {
@@ -467,9 +695,22 @@ impl SignPage {
 
     fn render_sign_form(this: &Rc<Self>, selected: &Rc<Selected>) -> Dom {
         let is_pdf = selected.analysis.kind == DataKind::Pdf;
-        let default_format = selected.analysis.default_format;
+        let is_xml = selected.analysis.kind == DataKind::Xml;
+        let formats: &[(&str, &str)] = match selected.analysis.default_format {
+            SignatureFormat::Pades => &[
+                ("pades", "PAdES (firma dentro del PDF)"),
+                ("cades", "CAdES"),
+                ("xades", "XAdES"),
+            ],
+            SignatureFormat::Facturae => &[
+                ("facturae", "FacturaE (factura electrónica)"),
+                ("xades", "XAdES"),
+                ("cades", "CAdES"),
+            ],
+            SignatureFormat::Xades => &[("xades", "XAdES"), ("cades", "CAdES")],
+            _ => &[("cades", "CAdES"), ("xades", "XAdES")],
+        };
         let options = &this.options;
-        let pades = options.format.signal().map(|f| f == SignatureFormat::Pades);
 
         html!("div", {
             .child(html!("div", {
@@ -478,17 +719,17 @@ impl SignPage {
                     html!("label", { .attr("for", "sign_format").text("Formato") }),
                     select(
                         "sign_format",
-                        if is_pdf {
-                            &[("pades", "PAdES (firma dentro del PDF)"), ("cades", "CAdES")]
-                        } else {
-                            &[("cades", "CAdES")]
-                        },
+                        formats,
                         match options.format.get() {
                             SignatureFormat::Pades => "pades",
+                            SignatureFormat::Xades => "xades",
+                            SignatureFormat::Facturae => "facturae",
                             _ => "cades",
                         },
                         clone!(this => move |value| this.options.format.set(match value.as_str() {
                             "pades" => SignatureFormat::Pades,
+                            "xades" => SignatureFormat::Xades,
+                            "facturae" => SignatureFormat::Facturae,
                             _ => SignatureFormat::Cades,
                         })),
                     ),
@@ -507,28 +748,16 @@ impl SignPage {
                             _ => DigestAlgorithm::Sha512,
                         })),
                     ),
-                    html!("label", { .attr("for", "sign_policy").text("Política de firma") }),
-                    select(
-                        "sign_policy",
-                        &[
-                            ("none", "Ninguna (BES)"),
-                            ("age19", PolicyPreset::Age19.name()),
-                            ("age18", PolicyPreset::Age18.name()),
-                        ],
-                        match options.policy.get() {
-                            None => "none",
-                            Some(PolicyPreset::Age19) => "age19",
-                            Some(PolicyPreset::Age18) => "age18",
-                        },
-                        clone!(this => move |value| this.options.policy.set(match value.as_str() {
-                            "age19" => Some(PolicyPreset::Age19),
-                            "age18" => Some(PolicyPreset::Age18),
-                            _ => None,
-                        })),
-                    ),
                 ])
-                .child_signal(pades.map(clone!(this => move |pades| {
-                    (!pades).then(|| Self::render_cades_options(&this))
+                // FacturaE has its own policy.
+                .child_signal(options.format.signal().map(clone!(this => move |format| {
+                    (format != SignatureFormat::Facturae).then(|| Self::render_policy(&this))
+                })))
+                .child_signal(options.format.signal().map(clone!(this => move |format| match format {
+                    SignatureFormat::Cades => Some(Self::render_cades_options(&this)),
+                    SignatureFormat::Xades => Some(Self::render_xades_options(&this, is_xml)),
+                    SignatureFormat::Facturae => Some(Self::render_facturae_options(&this)),
+                    _ => None,
                 })))
                 .children(&mut [
                     html!("span", { .text("Certificado") }),
@@ -546,16 +775,6 @@ impl SignPage {
                     }),
                 ])
             }))
-            .apply_if(!matches!(default_format, SignatureFormat::Cades | SignatureFormat::Pades), |dom| {
-                dom.child(html!("p", {
-                    .style("color", "var(--muted)")
-                    .text(&format!(
-                        "AutoFirma usaría {} para este fichero; ese formato estará disponible en una próxima fase. \
-                         Puede firmarlo ya en CAdES.",
-                        default_format.name()
-                    ))
-                }))
-            })
             .child_signal({
                 let page = this.clone();
                 map_ref! {
@@ -568,6 +787,7 @@ impl SignPage {
                     }
                 }
             })
+            .child(Self::render_timestamp_options(this, is_pdf))
             .child(Self::render_triphase_options(this))
             .child(html!("button", {
                 .attr("type", "button")
@@ -584,6 +804,150 @@ impl SignPage {
                 })
                 .event(clone!(this => move |_: events::Click| Self::sign(&this)))
             }))
+        })
+    }
+
+    fn render_policy(this: &Rc<Self>) -> Dom {
+        let options = &this.options;
+        html!("div", {
+            .style("display", "contents")
+            .children(&mut [
+                html!("label", { .attr("for", "sign_policy").text("Política de firma") }),
+                select(
+                    "sign_policy",
+                        &[
+                            ("none", "Ninguna (BES)"),
+                            ("age19", PolicyPreset::Age19.name()),
+                            ("age18", PolicyPreset::Age18.name()),
+                        ],
+                        match options.policy.get() {
+                            None => "none",
+                            Some(PolicyPreset::Age19) => "age19",
+                            Some(PolicyPreset::Age18) => "age18",
+                        },
+                        clone!(this => move |value| this.options.policy.set(match value.as_str() {
+                            "age19" => Some(PolicyPreset::Age19),
+                            "age18" => Some(PolicyPreset::Age18),
+                            _ => None,
+                        })),
+                    ),
+            ])
+        })
+    }
+
+    fn render_xades_options(this: &Rc<Self>, is_xml: bool) -> Dom {
+        let mut formats = vec![("enveloping", "Envolvente (los datos dentro de la firma)")];
+        if is_xml {
+            formats.push(("enveloped", "Envuelta (la firma dentro del XML)"));
+        }
+        formats.push(("detached", "Separada (datos y firma en un XML nuevo)"));
+        html!("div", {
+            .style("display", "contents")
+            .children(&mut [
+                html!("label", { .attr("for", "sign_xades_format").text("Tipo") }),
+                select(
+                    "sign_xades_format",
+                    &formats,
+                    match this.options.xades_format.get() {
+                        XadesFormat::Enveloping => "enveloping",
+                        XadesFormat::Enveloped => "enveloped",
+                        XadesFormat::Detached => "detached",
+                    },
+                    clone!(this => move |value| this.options.xades_format.set(match value.as_str() {
+                        "enveloped" => XadesFormat::Enveloped,
+                        "detached" => XadesFormat::Detached,
+                        _ => XadesFormat::Enveloping,
+                    })),
+                ),
+                html!("label", { .attr("for", "sign_city").text("Lugar") }),
+                text_input("sign_city", &this.options.location),
+                html!("span", { .text("Contenedor") }),
+                checkbox("sign_asic", "ASiC-S (fichero y firma en un ZIP)", &this.options.asic),
+            ])
+        })
+    }
+
+    fn render_facturae_options(this: &Rc<Self>) -> Dom {
+        html!("div", {
+            .style("display", "contents")
+            .children(&mut [
+                html!("label", { .attr("for", "sign_role").text("Firma como") }),
+                select(
+                    "sign_role",
+                    &[("emisor", "Emisor"), ("receptor", "Receptor"), ("tercero", "Tercero")],
+                    this.options.role.get().name(),
+                    clone!(this => move |value| this.options.role.set(match value.as_str() {
+                        "receptor" => FacturaeRole::Receiver,
+                        "tercero" => FacturaeRole::ThirdParty,
+                        _ => FacturaeRole::Issuer,
+                    })),
+                ),
+                html!("label", { .attr("for", "sign_city").text("Lugar") }),
+                text_input("sign_city", &this.options.location),
+            ])
+        })
+    }
+
+    fn render_timestamp_options(this: &Rc<Self>, is_pdf: bool) -> Dom {
+        let options = &this.options;
+        html!("details", {
+            .style("margin", "1rem 0")
+            .children(&mut [
+                html!("summary", { .attr("id", "timestamp_summary").text("Sello de tiempo") }),
+                html!("p", {
+                    .style("color", "var(--muted)")
+                    .text("Una autoridad de sellado de tiempo (TSA) certifica la fecha de la firma. Solo se le envía \
+                           una huella de la firma, nunca el documento. La TSA debe admitir peticiones desde esta \
+                           página (CORS).")
+                }),
+                checkbox("sign_timestamp", "Añadir sello de tiempo", &options.timestamp),
+                html!("div", {
+                    .class(&*OPTIONS_CLASS)
+                    .children(&mut [
+                        html!("label", { .attr("for", "sign_tsa").text("TSA") }),
+                        html!("input" => HtmlInputElement, {
+                            .attr("type", "url")
+                            .attr("id", "sign_tsa")
+                            .attr("placeholder", "https://tsa.ejemplo.es/tsa")
+                            .prop("value", options.tsa_url.get_cloned())
+                            .with_node!(element => {
+                                .event(clone!(this => move |_: events::Input| this.options.tsa_url.set(element.value())))
+                            })
+                        }),
+                        html!("label", { .attr("for", "sign_tsa_policy").text("Política de la TSA") }),
+                        html!("input" => HtmlInputElement, {
+                            .attr("type", "text")
+                            .attr("id", "sign_tsa_policy")
+                            .attr("placeholder", "Opcional, p. ej. 0.4.0.2023.1.1")
+                            .prop("value", options.tsa_policy.get_cloned())
+                            .with_node!(element => {
+                                .event(clone!(this => move |_: events::Input| this.options.tsa_policy.set(element.value())))
+                            })
+                        }),
+                    ])
+                    .apply_if(is_pdf, |dom| dom.children(&mut [
+                        html!("label", { .attr("for", "sign_pdf_timestamp").text("En el PDF") }),
+                        select(
+                            "sign_pdf_timestamp",
+                            &[
+                                ("signature", "Sellar la firma"),
+                                ("document", "Sellar el documento (nueva revisión)"),
+                                ("both", "Ambos"),
+                            ],
+                            match options.pdf_timestamp.get() {
+                                PdfTimestamp::Signature => "signature",
+                                PdfTimestamp::Document => "document",
+                                PdfTimestamp::Both => "both",
+                            },
+                            clone!(this => move |value| this.options.pdf_timestamp.set(match value.as_str() {
+                                "document" => PdfTimestamp::Document,
+                                "both" => PdfTimestamp::Both,
+                                _ => PdfTimestamp::Signature,
+                            })),
+                        ),
+                    ]))
+                }),
+            ])
         })
     }
 
@@ -607,6 +971,8 @@ impl SignPage {
                         _ => SignatureMode::Explicit,
                     })),
                 ),
+                html!("span", { .text("Contenedor") }),
+                checkbox("sign_asic", "ASiC-S (fichero y firma en un ZIP)", &this.options.asic),
             ])
         })
     }
@@ -765,7 +1131,7 @@ impl SignPage {
         html!("details", {
             .style("margin", "1rem 0")
             .children(&mut [
-                html!("summary", { .text("Firma trifásica (servidor)") }),
+                html!("summary", { .attr("id", "triphase_summary").text("Firma trifásica (servidor)") }),
                 html!("p", {
                     .style("color", "var(--muted)")
                     .text("La firma se compone en un servidor de firma trifásica de AutoFirma; el documento se envía al \

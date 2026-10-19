@@ -71,6 +71,24 @@ pub enum Error {
     /// Triphase signature protocol error.
     #[error("{0}")]
     Triphase(String),
+    /// The XML document could not be read.
+    #[error("el XML no es válido: {0}")]
+    InvalidXml(String),
+    /// The XML is not a FacturaE invoice.
+    #[error("el fichero no es una factura electrónica (FacturaE) válida")]
+    InvalidFacturae,
+    /// The FacturaE invoice is already signed.
+    #[error("la factura electrónica ya está firmada")]
+    FacturaeAlreadySigned,
+    /// Timestamp (RFC 3161) error.
+    #[error("sello de tiempo: {0}")]
+    Timestamp(String),
+    /// The ASiC container could not be read.
+    #[error("el contenedor ASiC no es válido: {0}")]
+    InvalidAsic(String),
+    /// No random values available.
+    #[error("no se pudieron generar valores aleatorios: {0}")]
+    Random(String),
     /// ASN.1 encoding error.
     #[error("error de codificación ASN.1: {0}")]
     Asn1(#[from] der::Error),

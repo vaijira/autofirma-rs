@@ -45,6 +45,7 @@ use crate::{
     error::{Error, Result},
     keystore::SigningKey,
     policy::SignaturePolicy,
+    tsp::{self, TimestampReport},
 };
 
 /// Whether the signed data is included in the signature.
@@ -78,6 +79,7 @@ pub struct PreparedSignature {
     to_be_signed: Vec<u8>,
     digest: DigestAlgorithm,
     key_type: KeyType,
+    content_type: ObjectIdentifier,
     content: Option<Vec<u8>>,
     chain: Vec<Certificate>,
 }
@@ -119,7 +121,7 @@ impl PreparedSignature {
             version: CmsVersion::V1,
             digest_algorithms: SetOfVec::try_from(vec![self.digest.algorithm_identifier()])?,
             encap_content_info: EncapsulatedContentInfo {
-                econtent_type: oid::DATA,
+                econtent_type: self.content_type,
                 econtent,
             },
             certificates: Some(CertificateSet(SetOfVec::try_from(certificates)?)),
@@ -164,6 +166,8 @@ pub(crate) struct AttributeOptions<'a> {
     pub content_description: Option<&'a str>,
     /// `signaturePolicyIdentifier` (EPES).
     pub policy: Option<&'a SignaturePolicy>,
+    /// `contentType`, `id-data` when `None`.
+    pub content_type: Option<ObjectIdentifier>,
 }
 
 /// First phase of a signature: builds the signed attributes for `data`.
@@ -188,6 +192,7 @@ pub fn prepare(
             signing_time: Some(params.signing_time),
             content_description: params.content_description.as_deref(),
             policy: params.policy.as_ref(),
+            content_type: None,
         },
     )
 }
@@ -206,8 +211,9 @@ pub(crate) fn prepare_digest(
         .first()
         .ok_or_else(|| Error::Certificate("falta el certificado del firmante".to_string()))?;
 
+    let content_type = options.content_type.unwrap_or(oid::DATA);
     let mut attributes = vec![
-        attribute(oid::CONTENT_TYPE, &oid::DATA)?,
+        attribute(oid::CONTENT_TYPE, &content_type)?,
         attribute(oid::MESSAGE_DIGEST, &OctetString::new(message_digest)?)?,
         signing_certificate_v2(leaf, digest)?,
     ];
@@ -236,6 +242,7 @@ pub(crate) fn prepare_digest(
         to_be_signed,
         digest,
         key_type,
+        content_type,
         content,
         chain: chain.to_vec(),
     })
@@ -261,6 +268,9 @@ pub struct SignerReport {
     pub policy: Option<String>,
     /// Verification result.
     pub status: SignerStatus,
+    /// Signature timestamps (CAdES-T, XAdES-T), oldest first.
+    #[serde(default)]
+    pub timestamps: Vec<TimestampReport>,
 }
 
 /// Outcome of the cryptographic verification of a signer.
@@ -274,6 +284,9 @@ pub enum SignerStatus {
     InvalidSignature,
     /// The signer's certificate is not included in the signature.
     CertificateNotFound,
+    /// The certificate named by the signed attributes (XAdES
+    /// `SigningCertificate`) is not the one included in the signature.
+    CertificateMismatch,
     /// The signature uses something not supported yet.
     Unsupported(String),
 }
@@ -348,6 +361,91 @@ fn parse_signed_data(signature: &[u8]) -> Result<SignedData> {
         .map_err(|e| Error::InvalidSignature(e.to_string()))
 }
 
+/// Signature timestamp tokens (`id-aa-signatureTimeStampToken`) of a signer, DER.
+fn timestamp_tokens(signer: &SignerInfo) -> Vec<Vec<u8>> {
+    signer
+        .unsigned_attrs
+        .iter()
+        .flat_map(|attrs| attrs.iter())
+        .filter(|attr| attr.oid == oid::SIGNATURE_TIMESTAMP_TOKEN)
+        .flat_map(|attr| attr.values.iter())
+        .filter_map(|value| value.to_der().ok())
+        .collect()
+}
+
+/// Verifies the signature timestamps of a signer: tokens over its signature value.
+fn signature_timestamps(signer: &SignerInfo) -> Vec<TimestampReport> {
+    let value = signer.signature.as_bytes();
+    let mut reports: Vec<TimestampReport> = timestamp_tokens(signer)
+        .iter()
+        .map(|token| tsp::verify_token(token, |digest| Ok(digest.digest(value))))
+        .collect();
+    reports.sort_by_key(|report| report.time);
+    reports
+}
+
+/// Digests to timestamp for CAdES-T: the signature value of every signer that
+/// has no signature timestamp yet, computed with `digest`.
+pub fn timestamp_imprints(signature: &[u8], digest: DigestAlgorithm) -> Result<Vec<Vec<u8>>> {
+    let signed_data = parse_signed_data(signature)?;
+    Ok(signed_data
+        .signer_infos
+        .0
+        .iter()
+        .filter(|signer| timestamp_tokens(signer).is_empty())
+        .map(|signer| digest.digest(signer.signature.as_bytes()))
+        .collect())
+}
+
+/// Adds signature timestamps (CAdES-T) from TSA `responses` to the signers
+/// they timestamp, matched by the imprint of each token.
+pub fn add_timestamps(
+    signature: &[u8],
+    digest: DigestAlgorithm,
+    responses: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let mut signed_data = parse_signed_data(signature)?;
+    let mut signers: Vec<SignerInfo> = signed_data.signer_infos.0.iter().cloned().collect();
+    let mut pending: Vec<&Vec<u8>> = responses.iter().collect();
+    for signer in signers
+        .iter_mut()
+        .filter(|signer| timestamp_tokens(signer).is_empty())
+    {
+        let imprint = digest.digest(signer.signature.as_bytes());
+        let Some(position) = pending
+            .iter()
+            .position(|response| tsp::token_for(response, digest, &imprint).is_ok())
+        else {
+            continue;
+        };
+        let token = tsp::token_for(pending.remove(position), digest, &imprint)?;
+        let attribute = Attribute {
+            oid: oid::SIGNATURE_TIMESTAMP_TOKEN,
+            values: SetOfVec::try_from(vec![Any::from_der(&token)?])?,
+        };
+        let mut attributes: Vec<Attribute> = signer
+            .unsigned_attrs
+            .iter()
+            .flat_map(|attrs| attrs.iter().cloned())
+            .collect();
+        attributes.push(attribute);
+        signer.unsigned_attrs = Some(SetOfVec::try_from(attributes)?);
+    }
+    if let Some(response) = pending.first() {
+        // Report why the response does not fit: rejection or a foreign token.
+        tsp::parse_response(response)?;
+        return Err(Error::Timestamp(
+            "el sello de tiempo no corresponde a la firma".to_string(),
+        ));
+    }
+    signed_data.signer_infos = SignerInfos(SetOfVec::try_from(signers)?);
+    let content_info = ContentInfo {
+        content_type: oid::SIGNED_DATA,
+        content: Any::encode_from(&signed_data)?,
+    };
+    Ok(content_info.to_der()?)
+}
+
 fn embedded(signed_data: &SignedData) -> Result<Option<Vec<u8>>> {
     signed_data
         .encap_content_info
@@ -383,6 +481,7 @@ fn verify_signer(
         signing_time: None,
         policy: None,
         status: SignerStatus::Valid,
+        timestamps: signature_timestamps(signer),
     };
 
     let Some(digest) = digest else {
@@ -442,7 +541,8 @@ fn verify_signer(
     Ok(report)
 }
 
-fn check_signature(
+/// Checks a PKCS#1 v1.5 (RSA) or DER ECDSA `signature` of `message` with the key of `certificate`.
+pub(crate) fn check_signature(
     certificate: &Certificate,
     digest: DigestAlgorithm,
     message: &[u8],

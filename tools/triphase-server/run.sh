@@ -23,7 +23,18 @@ for file in \
   es/gob/afirma/triphase/signer/processors/PAdESTriPhasePreProcessor.java \
   es/gob/afirma/triphase/signer/processors/CAdESTriPhasePreProcessor.java \
   es/gob/afirma/triphase/signer/cades/AOCAdESTriPhaseCoSigner.java \
-  es/gob/afirma/triphase/signer/cades/AOCAdESTriPhaseCounterSigner.java
+  es/gob/afirma/triphase/signer/cades/AOCAdESTriPhaseCounterSigner.java \
+  es/gob/afirma/triphase/signer/processors/XAdESTriPhasePreProcessor.java \
+  es/gob/afirma/triphase/signer/processors/XAdESTriPhaseSignerUtil.java \
+  es/gob/afirma/triphase/signer/processors/FacturaETriPhasePreProcessor.java \
+  es/gob/afirma/triphase/signer/xades/XAdESTriPhaseSignerServerSide.java \
+  es/gob/afirma/triphase/signer/xades/XmlPreSignResult.java \
+  es/gob/afirma/triphase/signer/xades/XmlPreSignException.java \
+  es/gob/afirma/triphase/signer/xades/NodeDelimiter.java \
+  es/gob/afirma/triphase/signer/xades/KeyHelper.java \
+  es/gob/afirma/triphase/signer/xades/KeyHelperFactory.java \
+  es/gob/afirma/triphase/signer/xades/KeyHelperRsa.java \
+  es/gob/afirma/triphase/signer/xades/KeyHelperEcdsa.java
 do
   if [ ! -f "$SRC/$file" ]; then
     mkdir -p "$SRC/$(dirname "$file")"

@@ -18,6 +18,8 @@ import es.gob.afirma.core.signers.TriphaseData;
 import es.gob.afirma.triphase.signer.processors.CAdESTriPhasePreProcessor;
 import es.gob.afirma.triphase.signer.processors.PAdESTriPhasePreProcessor;
 import es.gob.afirma.triphase.signer.processors.TriPhasePreProcessor;
+import es.gob.afirma.triphase.signer.processors.FacturaETriPhasePreProcessor;
+import es.gob.afirma.triphase.signer.processors.XAdESTriPhasePreProcessor;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -95,6 +97,10 @@ public class TriphaseServer {
             processor = new PAdESTriPhasePreProcessor();
         } else if ("cades".equalsIgnoreCase(format)) {
             processor = new CAdESTriPhasePreProcessor();
+        } else if ("xades".equalsIgnoreCase(format)) {
+            processor = new XAdESTriPhasePreProcessor();
+        } else if ("facturae".equalsIgnoreCase(format)) {
+            processor = new FacturaETriPhasePreProcessor();
         } else {
             return "ERR-06:Formato no soportado: " + format;
         }

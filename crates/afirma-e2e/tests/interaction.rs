@@ -279,7 +279,7 @@ async fn signs_a_pdf_through_a_triphase_server() -> WebDriverResult<()> {
         .await?;
     wait(&driver, By::Id("pades_options")).await?;
     driver
-        .find(By::Css("details summary"))
+        .find(By::Id("triphase_summary"))
         .await?
         .click()
         .await?;
@@ -293,6 +293,157 @@ async fn signs_a_pdf_through_a_triphase_server() -> WebDriverResult<()> {
     driver.find(By::Id("sign_button")).await?.click().await?;
     let result = signature_result(&driver).await?;
     assert!(result.contains("PDF firmado en PAdES"), "{result}");
+
+    driver.quit().await
+}
+
+/// Selects `value` in the `<select>` with `id`.
+async fn choose(driver: &WebDriver, id: &str, value: &str) -> WebDriverResult<()> {
+    wait(driver, By::Id(id))
+        .await?
+        .find(By::Css(&format!("option[value='{value}']")))
+        .await?
+        .click()
+        .await
+}
+
+#[tokio::test]
+#[ignore]
+async fn signs_xml_in_xades_facturae_and_asic() -> WebDriverResult<()> {
+    let driver = driver().await?;
+    import_certificate(&driver).await?;
+    driver.find(By::LinkText("Firmar")).await?.click().await?;
+
+    // XML: XAdES preselected; enveloped.
+    wait(&driver, By::Id("sign_file"))
+        .await?
+        .send_keys(format!("{}/xades/doc.xml", test_data()))
+        .await?;
+    let format = wait(&driver, By::Css("#file_format td"))
+        .await?
+        .text()
+        .await?;
+    assert_eq!(format, "XAdES");
+    choose(&driver, "sign_xades_format", "enveloped").await?;
+    driver.find(By::Id("sign_button")).await?.click().await?;
+    let result = signature_result(&driver).await?;
+    assert!(result.contains("Firma XAdES generada"), "{result}");
+    assert!(result.contains("doc.xml.xsig"), "{result}");
+
+    // FacturaE invoice: detected and signed as such.
+    driver
+        .find(By::Id("sign_file"))
+        .await?
+        .send_keys(format!("{}/xades/factura.xml", test_data()))
+        .await?;
+    wait(&driver, By::Id("sign_role")).await?;
+    driver.find(By::Id("sign_button")).await?.click().await?;
+    let result = signature_result(&driver).await?;
+    assert!(result.contains("Factura electrónica firmada"), "{result}");
+
+    // Binary data in a CAdES ASiC-S container.
+    driver
+        .find(By::Id("sign_file"))
+        .await?
+        .send_keys(format!("{}/xades/doc.txt", test_data()))
+        .await?;
+    wait(&driver, By::Id("sign_asic")).await?.click().await?;
+    driver.find(By::Id("sign_button")).await?.click().await?;
+    let result = signature_result(&driver).await?;
+    assert!(
+        result.contains("Contenedor ASiC-S con firma CAdES"),
+        "{result}"
+    );
+    assert!(result.contains("doc.txt.asics"), "{result}");
+
+    driver.quit().await
+}
+
+#[tokio::test]
+#[ignore]
+async fn verifies_xml_and_asic_signatures() -> WebDriverResult<()> {
+    let driver = driver().await?;
+    driver.goto(format!("{APP_URL}#/verify")).await?;
+    for (file, expected) in [
+        (
+            "xades/autofirma-enveloped-age-rsa.xsig",
+            "Documento XML con 1 firma",
+        ),
+        (
+            "xades/autofirma-facturae-rsa.xsig",
+            "Documento XML con 1 firma",
+        ),
+        ("asic/autofirma-xades-rsa.asics", "Contenedor ASiC-S"),
+    ] {
+        wait(&driver, By::Id("verify_file"))
+            .await?
+            .send_keys(format!("{}/{file}", test_data()))
+            .await?;
+        // Wait for this file's result, not the previous one.
+        let summary = driver
+            .query(By::Id("verify_summary"))
+            .with_text(expected.to_string())
+            .wait(Duration::from_secs(10), Duration::from_millis(200));
+        let summary = match summary.first().await {
+            Ok(summary) => summary.text().await?,
+            Err(_) => driver.find(By::Id("verify_summary")).await?.text().await?,
+        };
+        assert!(
+            summary.contains("Firmas válidas") && summary.contains(expected),
+            "{file}: {summary}"
+        );
+    }
+    driver.quit().await
+}
+
+/// Needs a TSA that allows the app's origin, such as `tools/tsa-server/tsa.py`;
+/// skipped unless `TSA_URL` is set (for instance to `http://127.0.0.1:8091/`).
+#[tokio::test]
+#[ignore]
+async fn signs_with_timestamps() -> WebDriverResult<()> {
+    let Ok(tsa) = std::env::var("TSA_URL") else {
+        eprintln!("TSA_URL not set, skipping");
+        return Ok(());
+    };
+    let driver = driver().await?;
+    import_certificate(&driver).await?;
+    driver.find(By::LinkText("Firmar")).await?.click().await?;
+
+    // PDF: signature and document timestamps.
+    wait(&driver, By::Id("sign_file"))
+        .await?
+        .send_keys(format!("{}/pades/doc.pdf", test_data()))
+        .await?;
+    wait(&driver, By::Id("pades_options")).await?;
+    driver
+        .find(By::Id("timestamp_summary"))
+        .await?
+        .click()
+        .await?;
+    driver.find(By::Id("sign_timestamp")).await?.click().await?;
+    driver
+        .find(By::Id("sign_tsa"))
+        .await?
+        .send_keys(&tsa)
+        .await?;
+    choose(&driver, "sign_pdf_timestamp", "both").await?;
+    driver.find(By::Id("sign_button")).await?.click().await?;
+    let result = signature_result(&driver).await?;
+    assert!(result.contains("con sello de tiempo"), "{result}");
+
+    // XAdES-T: the timestamp options stay set for the next file.
+    driver
+        .find(By::Id("sign_file"))
+        .await?
+        .send_keys(format!("{}/xades/doc.xml", test_data()))
+        .await?;
+    wait(&driver, By::Id("sign_xades_format")).await?;
+    driver.find(By::Id("sign_button")).await?.click().await?;
+    let result = signature_result(&driver).await?;
+    assert!(
+        result.contains("Firma XAdES generada con sello de tiempo"),
+        "{result}"
+    );
 
     driver.quit().await
 }

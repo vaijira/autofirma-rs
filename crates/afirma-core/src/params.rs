@@ -6,10 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cades::{CadesParams, SignatureMode},
+    facturae::FacturaeParams,
     pades::{
         CertificationLevel, FontColor, FontFamily, PadesParams, SignaturePages, VisibleSignature,
     },
     policy::SignaturePolicy,
+    tsp::TimestampParams,
+    xades::{ProductionPlace, XadesParams},
 };
 
 /// Ordered list of AutoFirma extra parameters.
@@ -159,6 +162,58 @@ impl From<&PadesParams> for ExtraParams {
     }
 }
 
+impl ExtraParams {
+    /// Adds `signatureProduction*` and `signerClaimedRoles` (roles separated by `|`).
+    fn set_place_and_roles(&mut self, place: &ProductionPlace, roles: &[String]) {
+        for (key, value) in [
+            ("signatureProductionCity", &place.city),
+            ("signatureProductionProvince", &place.province),
+            ("signatureProductionPostalCode", &place.postal_code),
+            ("signatureProductionCountry", &place.country),
+        ] {
+            if let Some(value) = value {
+                self.set(key, value.clone());
+            }
+        }
+        if !roles.is_empty() {
+            self.set("signerClaimedRoles", roles.join("|"));
+        }
+    }
+
+    /// Adds the timestamp parameters (`tsaURL`, `tsaPolicy`, `tsaHashAlgorithm`).
+    /// `tsType` (PAdES): `1` signature timestamp, `2` document timestamp, `3` both.
+    pub fn set_timestamp(&mut self, timestamp: &TimestampParams, ts_type: Option<u8>) {
+        self.set("tsaURL", timestamp.url.clone());
+        if let Some(policy) = &timestamp.policy {
+            self.set("tsaPolicy", policy.clone());
+        }
+        self.set("tsaHashAlgorithm", timestamp.digest.name().replace('-', ""));
+        if let Some(ts_type) = ts_type {
+            self.set("tsType", ts_type.to_string());
+        }
+    }
+}
+
+impl From<&XadesParams> for ExtraParams {
+    fn from(params: &XadesParams) -> Self {
+        let mut extra = ExtraParams::default();
+        extra.set("format", params.format.name());
+        if let Some(policy) = &params.policy {
+            extra.set_policy(policy);
+        }
+        extra.set_place_and_roles(&params.production_place, &params.claimed_roles);
+        extra
+    }
+}
+
+impl From<&FacturaeParams> for ExtraParams {
+    fn from(params: &FacturaeParams) -> Self {
+        let mut extra = ExtraParams::default();
+        extra.set_place_and_roles(&params.production_place, &[params.role.name().to_string()]);
+        extra
+    }
+}
+
 fn add_visible(extra: &mut ExtraParams, visible: &VisibleSignature) {
     let pages = match &visible.pages {
         SignaturePages::Last => "-1".to_string(),
@@ -276,6 +331,35 @@ mod tests {
             extra.get("policyIdentifierHashAlgorithm"),
             Some("http://www.w3.org/2000/09/xmldsig#sha1")
         );
+    }
+
+    #[test]
+    fn xades_params() {
+        let extra = ExtraParams::from(&XadesParams {
+            format: crate::xades::XadesFormat::Enveloped,
+            production_place: ProductionPlace {
+                city: Some("Madrid".to_string()),
+                ..ProductionPlace::default()
+            },
+            claimed_roles: vec!["emisor".to_string(), "firmante".to_string()],
+            ..XadesParams::new(0)
+        });
+        assert_eq!(extra.get("format"), Some("XAdES Enveloped"));
+        assert_eq!(extra.get("signatureProductionCity"), Some("Madrid"));
+        assert_eq!(extra.get("signerClaimedRoles"), Some("emisor|firmante"));
+
+        let mut extra = ExtraParams::from(&FacturaeParams::new(0));
+        assert_eq!(extra.get("signerClaimedRoles"), Some("emisor"));
+        extra.set_timestamp(
+            &TimestampParams {
+                url: "https://tsa".to_string(),
+                policy: None,
+                digest: DigestAlgorithm::Sha512,
+            },
+            Some(1),
+        );
+        assert_eq!(extra.get("tsaHashAlgorithm"), Some("SHA512"));
+        assert_eq!(extra.get("tsType"), Some("1"));
     }
 
     #[test]

@@ -488,10 +488,27 @@ struct SignatureDictionary {
 const BYTE_RANGE_DIGITS: usize = 10;
 
 impl SignatureDictionary {
+    /// Dictionary of a signature (`/Sig`, `ETSI.CAdES.detached`).
     fn new(entries: &Dictionary, contents_len: usize) -> Self {
-        let mut bytes =
-            b"<</Type /Sig/Filter /Adobe.PPKLite/SubFilter /ETSI.CAdES.detached/ByteRange "
-                .to_vec();
+        Self::with_header(
+            b"<</Type /Sig/Filter /Adobe.PPKLite/SubFilter /ETSI.CAdES.detached",
+            entries,
+            contents_len,
+        )
+    }
+
+    /// Dictionary of a document timestamp (`/DocTimeStamp`, `ETSI.RFC3161`).
+    fn document_timestamp(contents_len: usize) -> Self {
+        Self::with_header(
+            b"<</Type /DocTimeStamp/Filter /Adobe.PPKLite/SubFilter /ETSI.RFC3161",
+            &Dictionary::new(),
+            contents_len,
+        )
+    }
+
+    fn with_header(header: &[u8], entries: &Dictionary, contents_len: usize) -> Self {
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(b"/ByteRange ");
         let byte_range = bytes.len();
         let zero = "0".repeat(BYTE_RANGE_DIGITS);
         bytes.extend_from_slice(format!("[0 {zero} {zero} {zero}]").as_bytes());
@@ -1072,23 +1089,8 @@ pub fn prepare(
         update.dict_mut(catalog_id)?.set("Perms", perms);
     }
 
-    let (mut output, signature_offset) = update.write(pdf)?;
-
-    // ByteRange: everything but the /Contents hex string.
-    let contents_start = signature_offset + contents_offset;
-    let contents_end = contents_start + 2 + 2 * reserved;
-    let byte_range = format!(
-        "[0 {contents_start} {contents_end} {}",
-        output.len() - contents_end
-    );
-    // Same width as the placeholder: `[0 ` + three numbers and two spaces, then `]`.
-    let width = 3 + 3 * BYTE_RANGE_DIGITS + 2;
-    if byte_range.len() > width {
-        return Err(Error::InvalidPdf("el PDF es demasiado grande".to_string()));
-    }
-    let byte_range = format!("{byte_range:<width$}]");
-    let start = signature_offset + byte_range_offset;
-    output[start..start + byte_range.len()].copy_from_slice(byte_range.as_bytes());
+    let (output, contents_start, contents_end) =
+        write_with_byte_range(update, pdf, byte_range_offset, contents_offset, reserved)?;
 
     let message_digest = params
         .digest
@@ -1108,6 +1110,201 @@ pub fn prepare(
         contents_end,
         cms,
     })
+}
+
+/// Writes `update` after `pdf` and fills the `/ByteRange` of its signature
+/// dictionary, whose placeholders are at `byte_range_offset` and
+/// `contents_offset` within it. Returns the document and the `/Contents` gap.
+fn write_with_byte_range(
+    update: Update<'_>,
+    pdf: &[u8],
+    byte_range_offset: usize,
+    contents_offset: usize,
+    reserved: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
+    let (mut output, signature_offset) = update.write(pdf)?;
+
+    // ByteRange: everything but the /Contents hex string.
+    let contents_start = signature_offset + contents_offset;
+    let contents_end = contents_start + 2 + 2 * reserved;
+    let byte_range = format!(
+        "[0 {contents_start} {contents_end} {}",
+        output.len() - contents_end
+    );
+    // Same width as the placeholder: `[0 ` + three numbers and two spaces, then `]`.
+    let width = 3 + 3 * BYTE_RANGE_DIGITS + 2;
+    if byte_range.len() > width {
+        return Err(Error::InvalidPdf("el PDF es demasiado grande".to_string()));
+    }
+    let byte_range = format!("{byte_range:<width$}]");
+    let start = signature_offset + byte_range_offset;
+    output[start..start + byte_range.len()].copy_from_slice(byte_range.as_bytes());
+    Ok((output, contents_start, contents_end))
+}
+
+/// The `/Contents` gap of the last signature added to `pdf` (the one at the
+/// highest `ByteRange`), as `(start of <, end after >)`.
+fn last_contents_gap(pdf: &[u8]) -> Result<(usize, usize)> {
+    let invalid = || Error::InvalidPdf("el PDF no tiene firmas".to_string());
+    let mut best: Option<(usize, usize)> = None;
+    let mut from = 0;
+    while let Some(found) = pdf[from..].windows(10).position(|w| w == b"/ByteRange") {
+        let at = from + found + 10;
+        from = at;
+        let rest = &pdf[at..pdf.len().min(at + 64)];
+        let Some(open) = rest.iter().position(|&b| b == b'[') else {
+            continue;
+        };
+        let Some(close) = rest.iter().position(|&b| b == b']') else {
+            continue;
+        };
+        let numbers: Vec<usize> = std::str::from_utf8(&rest[open + 1..close.max(open + 1)])
+            .unwrap_or("")
+            .split_whitespace()
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        if let [0, start, end, _] = numbers[..]
+            && start < end
+            && end <= pdf.len()
+            && pdf[start] == b'<'
+            && pdf[end - 1] == b'>'
+            && best.is_none_or(|(s, _)| start > s)
+        {
+            best = Some((start, end));
+        }
+    }
+    best.ok_or_else(invalid)
+}
+
+/// Writes `cms` into the `/Contents` gap `(start, end)`, padded with zeros.
+fn fill_contents(pdf: &mut [u8], (start, end): (usize, usize), cms: &[u8]) -> Result<()> {
+    let reserved = (end - start - 2) / 2;
+    if cms.len() > reserved {
+        return Err(Error::SignatureTooLarge {
+            needed: cms.len(),
+            reserved,
+        });
+    }
+    let mut hex = crate::digest::to_hex(cms).into_bytes();
+    hex.resize(reserved * 2, b'0');
+    pdf[start + 1..end - 1].copy_from_slice(&hex);
+    Ok(())
+}
+
+/// The CMS signature in the `/Contents` gap.
+fn contents_cms(pdf: &[u8], (start, end): (usize, usize)) -> Result<Vec<u8>> {
+    let hex = std::str::from_utf8(&pdf[start + 1..end - 1])
+        .map_err(|_| Error::InvalidPdf("/Contents no es hexadecimal".to_string()))?;
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| Error::InvalidPdf("/Contents no es hexadecimal".to_string()))?;
+    // Drop the zero padding after the DER structure.
+    verify::der_prefix(&bytes)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| Error::InvalidPdf("/Contents no contiene una firma CMS".to_string()))
+}
+
+/// Digests to timestamp for a signature timestamp (PAdES-T): the signature
+/// value of the last signature of `pdf`.
+pub fn timestamp_imprints(pdf: &[u8], digest: DigestAlgorithm) -> Result<Vec<Vec<u8>>> {
+    cades::timestamp_imprints(&contents_cms(pdf, last_contents_gap(pdf)?)?, digest)
+}
+
+/// Adds signature timestamps to the CMS of the last signature of `pdf`. The
+/// CMS is replaced in place, so it must fit in the space reserved when signing.
+pub fn add_timestamps(
+    pdf: &[u8],
+    digest: DigestAlgorithm,
+    responses: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let gap = last_contents_gap(pdf)?;
+    let cms = cades::add_timestamps(&contents_cms(pdf, gap)?, digest, responses)?;
+    let mut out = pdf.to_vec();
+    fill_contents(&mut out, gap, &cms)?;
+    Ok(out)
+}
+
+/// Space reserved for a document timestamp token: TSA tokens with their
+/// certificate chain are usually 3 to 8 KB.
+const DOCUMENT_TIMESTAMP_RESERVED: usize = 16 * 1024;
+
+/// First phase of a document timestamp (PAdES-LTA's `DocTimeStamp`): appends
+/// an invisible `ETSI.RFC3161` field to `pdf` and returns the PDF and the
+/// digest of its signed bytes, to request the token from the TSA. The token is
+/// added with [`add_document_timestamp`].
+pub fn prepare_document_timestamp(
+    pdf: &[u8],
+    password: Option<&str>,
+    digest: DigestAlgorithm,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let doc = load(pdf, password)?;
+    if certification(&doc) == CertificationLevel::NoChanges {
+        return Err(Error::PdfCertified);
+    }
+    let existing = signature_fields(&doc);
+    let mut update = Update::new(&doc);
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(|_| Error::InvalidPdf("falta el catálogo".to_string()))?;
+    let first_page = *doc
+        .get_pages()
+        .values()
+        .next()
+        .ok_or_else(|| Error::InvalidPdf("el documento no tiene páginas".to_string()))?;
+
+    let signature_id = (update.next_id, 0);
+    update.next_id += 1;
+    let dictionary = SignatureDictionary::document_timestamp(DOCUMENT_TIMESTAMP_RESERVED);
+    let (byte_range_offset, contents_offset) = (dictionary.byte_range, dictionary.contents);
+    update
+        .objects
+        .insert(signature_id, Body::Signature(dictionary));
+
+    let field_name = (1..)
+        .map(|n| format!("Timestamp{n}"))
+        .find(|candidate| existing.iter().all(|f| &f.name != candidate))
+        .expect("infinite candidates");
+    let mut field = Dictionary::new();
+    field.set("FT", name("Sig"));
+    field.set("T", text_string(&field_name));
+    field.set("V", signature_id);
+    field.set("Type", name("Annot"));
+    field.set("Subtype", name("Widget"));
+    field.set("F", 132);
+    field.set("P", first_page);
+    field.set("Rect", rect_object([0.0; 4]));
+    let field_id = update.add(field);
+    update.push(first_page, b"Annots", field_id.into())?;
+    let form_id = update.indirect_dict(catalog_id, b"AcroForm")?;
+    update.push(form_id, b"Fields", field_id.into())?;
+    update.dict_mut(form_id)?.set("SigFlags", 3);
+
+    let (output, contents_start, contents_end) = write_with_byte_range(
+        update,
+        pdf,
+        byte_range_offset,
+        contents_offset,
+        DOCUMENT_TIMESTAMP_RESERVED,
+    )?;
+    let imprint = digest.digest_parts(&[&output[..contents_start], &output[contents_end..]]);
+    Ok((output, imprint))
+}
+
+/// Adds the token of a TSA `response` to a PDF from [`prepare_document_timestamp`].
+pub fn add_document_timestamp(
+    prepared: &[u8],
+    digest: DigestAlgorithm,
+    response: &[u8],
+) -> Result<Vec<u8>> {
+    let (start, end) = last_contents_gap(prepared)?;
+    let imprint = digest.digest_parts(&[&prepared[..start], &prepared[end..]]);
+    let token = crate::tsp::token_for(response, digest, &imprint)?;
+    let mut out = prepared.to_vec();
+    fill_contents(&mut out, (start, end), &token)?;
+    Ok(out)
 }
 
 /// Pages for a visible signature, appending a blank page if requested.

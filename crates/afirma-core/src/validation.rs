@@ -3,10 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    asic::{self, AsicReport},
     cades::{self, VerifyReport},
     error::{Error, Result},
     format::DataKind,
     pades::{self, PdfVerifyReport},
+    xades::{self, XadesVerifyReport},
 };
 
 /// Result of verifying a signature, by format.
@@ -16,6 +18,10 @@ pub enum Verification {
     Cades(VerifyReport),
     /// Signatures of a PDF.
     Pades(PdfVerifyReport),
+    /// XAdES / XMLDSig signatures of an XML document (FacturaE included).
+    Xades(XadesVerifyReport),
+    /// ASiC-S container.
+    Asic(AsicReport),
 }
 
 impl Verification {
@@ -24,13 +30,16 @@ impl Verification {
         match self {
             Verification::Cades(report) => report.is_valid(),
             Verification::Pades(report) => report.is_valid(),
+            Verification::Xades(report) => report.is_valid(),
+            Verification::Asic(report) => report.signature.is_valid(),
         }
     }
 }
 
 /// Verifies the integrity of `signature`.
 ///
-/// `data` is the signed data of explicit (detached) CAdES signatures;
+/// `data` is the signed data of explicit (detached) CAdES signatures and of
+/// XAdES signatures that reference an external file;
 /// `pdf_password` opens encrypted PDFs. Certificate trust and revocation are
 /// not checked.
 pub fn verify(
@@ -44,11 +53,12 @@ pub fn verify(
     match DataKind::detect(signature) {
         DataKind::Pdf => pades::verify(signature, pdf_password).map(Verification::Pades),
         DataKind::CmsSignedData => cades::verify(signature, data).map(Verification::Cades),
-        DataKind::Xml => Err(Error::Unsupported(
-            "la verificación de firmas XAdES llegará en la fase P3".to_string(),
-        )),
+        DataKind::Xml => xades::verify(signature, data).map(Verification::Xades),
+        DataKind::Zip if asic::is_asic(signature) => {
+            asic::verify(signature).map(Verification::Asic)
+        }
         _ => Err(Error::InvalidSignature(
-            "el fichero no es una firma CAdES ni un PDF".to_string(),
+            "el fichero no es una firma CAdES, XAdES, ASiC ni un PDF".to_string(),
         )),
     }
 }
@@ -77,6 +87,12 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cades, Verification::Cades(_)) && cades.is_valid());
+
+        let xades = verify(&fixture("xades/autofirma-facturae-rsa.xsig"), None, None).unwrap();
+        assert!(matches!(xades, Verification::Xades(_)) && xades.is_valid());
+
+        let asic = verify(&fixture("asic/autofirma-xades-rsa.asics"), None, None).unwrap();
+        assert!(matches!(asic, Verification::Asic(_)) && asic.is_valid());
 
         assert!(matches!(
             verify(b"hola", None, None),

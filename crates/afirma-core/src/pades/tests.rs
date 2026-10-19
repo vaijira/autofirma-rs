@@ -375,3 +375,69 @@ fn reserved_size_is_enough_and_small() {
     // The estimate wins over a too small explicit size.
     assert!(err.is_ok());
 }
+
+#[test]
+fn signature_and_document_timestamps() {
+    use crate::tsp::{self, tests::tsa_response};
+
+    let key = &load_keys("rsa.p12")[0];
+    for (input, password) in [("doc.pdf", None), ("doc-aes256.pdf", Some("user"))] {
+        // A signature with room for its timestamp, as the UI reserves it.
+        let signed = sign(
+            &fixture(input),
+            key,
+            &PadesParams {
+                password: password.map(str::to_string),
+                reserved_size: Some(32 * 1024),
+                ..params()
+            },
+        )
+        .unwrap();
+
+        let imprints = timestamp_imprints(&signed, DigestAlgorithm::Sha256).unwrap();
+        assert_eq!(imprints.len(), 1);
+        let response = tsa_response(
+            &tsp::request(DigestAlgorithm::Sha256, &imprints[0], None).unwrap(),
+            "20261016140755Z",
+        );
+        let stamped = add_timestamps(&signed, DigestAlgorithm::Sha256, &[response]).unwrap();
+        assert_eq!(stamped.len(), signed.len());
+        let report = assert_valid(&stamped, password, 1);
+        let timestamps = &report.signatures[0].signer.timestamps;
+        assert_eq!(timestamps.len(), 1, "{input}");
+        assert_eq!(timestamps[0].status, SignerStatus::Valid);
+        assert_eq!(timestamps[0].time, Some(SIGNING_TIME + 1));
+
+        // Document timestamp on top.
+        let (prepared, imprint) =
+            prepare_document_timestamp(&stamped, password, DigestAlgorithm::Sha512).unwrap();
+        let response = tsa_response(
+            &tsp::request(DigestAlgorithm::Sha512, &imprint, None).unwrap(),
+            "20261016140756Z",
+        );
+        assert!(add_document_timestamp(&prepared, DigestAlgorithm::Sha256, &response).is_err());
+        let done = add_document_timestamp(&prepared, DigestAlgorithm::Sha512, &response).unwrap();
+        let report = assert_valid(&done, password, 2);
+        let document = &report.signatures[1];
+        assert_eq!(document.sub_filter, "ETSI.RFC3161");
+        assert_eq!(document.signer.signing_time, Some(SIGNING_TIME + 2));
+        assert!(!report.signatures[0].covers_whole_document);
+    }
+}
+
+#[test]
+fn timestamp_must_fit_in_the_reserved_space() {
+    use crate::tsp::{self, tests::tsa_response};
+
+    let key = &load_keys("ec.p12")[0];
+    let signed = sign(&fixture("doc.pdf"), key, &params()).unwrap();
+    let imprint = &timestamp_imprints(&signed, DigestAlgorithm::Sha256).unwrap()[0];
+    let response = tsa_response(
+        &tsp::request(DigestAlgorithm::Sha256, imprint, None).unwrap(),
+        "20261016140755Z",
+    );
+    assert!(matches!(
+        add_timestamps(&signed, DigestAlgorithm::Sha256, &[response]),
+        Err(Error::SignatureTooLarge { .. })
+    ));
+}

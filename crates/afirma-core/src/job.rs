@@ -13,15 +13,19 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::{
+    asic,
     cades::{self, CadesParams},
     cert::CertificateInfo,
     digest::{DigestAlgorithm, to_hex},
     error::{Error, Result},
+    facturae::{self, FacturaeParams},
     format::{DataKind, SignatureFormat},
     keystore::{SigningKey, SoftKey, load_pkcs12},
     pades::{self, PadesParams, PdfInfo},
     triphase::{self, TriphaseData},
+    tsp,
     validation::{self, Verification},
+    xades::{self, XadesParams},
 };
 
 /// Message sent from the UI to the worker.
@@ -116,12 +120,88 @@ pub enum Job {
         /// Digest algorithm.
         digest: DigestAlgorithm,
     },
-    /// Verify a signature (CAdES or PDF).
+    /// Create a XAdES signature.
+    SignXades {
+        /// Data to sign.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+        /// Signature parameters.
+        params: Box<XadesParams>,
+    },
+    /// Sign a FacturaE invoice.
+    SignFacturae {
+        /// The invoice.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+        /// Signature parameters.
+        params: FacturaeParams,
+    },
+    /// Sign data into an ASiC-S container.
+    SignAsic {
+        /// Data to sign.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Name of the data file in the container (`dataobject.<ext>` when `None`).
+        file_name: Option<String>,
+        /// Key id.
+        key_id: u32,
+        /// Signature inside the container.
+        params: Box<AsicSignature>,
+    },
+    /// Build the timestamp requests for the signature timestamps of a signature
+    /// (CAdES, XAdES, PDF or ASiC-S): one request body per signature to timestamp.
+    TimestampRequests {
+        /// The signature or signed document.
+        #[serde(with = "serde_bytes")]
+        signed: Vec<u8>,
+        /// Digest algorithm of the imprints.
+        digest: DigestAlgorithm,
+        /// TSA policy OID.
+        policy: Option<String>,
+    },
+    /// Add the tokens of the TSA responses to a signature.
+    AddTimestamps {
+        /// The signature or signed document.
+        #[serde(with = "serde_bytes")]
+        signed: Vec<u8>,
+        /// Digest algorithm of the imprints.
+        digest: DigestAlgorithm,
+        /// TSA responses, one per request.
+        responses: Vec<serde_bytes::ByteBuf>,
+    },
+    /// Append a document timestamp field to a PDF and build its timestamp request.
+    PrepareDocumentTimestamp {
+        /// PDF contents.
+        #[serde(with = "serde_bytes")]
+        pdf: Vec<u8>,
+        /// Password of an encrypted PDF.
+        password: Option<String>,
+        /// Digest algorithm of the imprint.
+        digest: DigestAlgorithm,
+        /// TSA policy OID.
+        policy: Option<String>,
+    },
+    /// Add the token of a TSA response to a PDF from [`Job::PrepareDocumentTimestamp`].
+    AddDocumentTimestamp {
+        /// The prepared PDF.
+        #[serde(with = "serde_bytes")]
+        prepared: Vec<u8>,
+        /// Digest algorithm of the imprint.
+        digest: DigestAlgorithm,
+        /// TSA response.
+        #[serde(with = "serde_bytes")]
+        response: Vec<u8>,
+    },
+    /// Verify a signature (CAdES, XAdES, ASiC-S or PDF).
     Verify {
         /// Signature, or signed PDF.
         #[serde(with = "serde_bytes")]
         signature: Vec<u8>,
-        /// Signed data of an explicit (detached) CAdES signature.
+        /// Signed data of an explicit (detached) CAdES or XAdES signature.
         #[serde(with = "serde_bytes", default)]
         data: Option<Vec<u8>>,
         /// Password of an encrypted PDF.
@@ -140,6 +220,13 @@ impl std::fmt::Debug for Job {
             Job::PdfInfo { .. } => "PdfInfo",
             Job::SignPades { .. } => "SignPades",
             Job::SignTriphase { .. } => "SignTriphase",
+            Job::SignXades { .. } => "SignXades",
+            Job::SignFacturae { .. } => "SignFacturae",
+            Job::SignAsic { .. } => "SignAsic",
+            Job::TimestampRequests { .. } => "TimestampRequests",
+            Job::AddTimestamps { .. } => "AddTimestamps",
+            Job::PrepareDocumentTimestamp { .. } => "PrepareDocumentTimestamp",
+            Job::AddDocumentTimestamp { .. } => "AddDocumentTimestamp",
             Job::Verify { .. } => "Verify",
         };
         f.write_str(name)
@@ -163,6 +250,26 @@ pub enum JobOutput {
     Triphase(TriphaseData),
     /// Output of [`Job::Verify`].
     Verification(Verification),
+    /// Output of [`Job::TimestampRequests`]: the request bodies.
+    TimestampRequests(Vec<serde_bytes::ByteBuf>),
+    /// Output of [`Job::PrepareDocumentTimestamp`].
+    DocumentTimestamp {
+        /// The PDF with the empty timestamp field.
+        #[serde(with = "serde_bytes")]
+        prepared: Vec<u8>,
+        /// Body of the timestamp request.
+        #[serde(with = "serde_bytes")]
+        request: Vec<u8>,
+    },
+}
+
+/// Signature inside an ASiC-S container.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AsicSignature {
+    /// CAdES (always explicit).
+    Cades(CadesParams),
+    /// XAdES referencing the data file.
+    Xades(XadesParams),
 }
 
 /// Information about a loaded file.
@@ -274,6 +381,89 @@ impl Engine {
                 session.sign(key, digest)?;
                 Ok(JobOutput::Triphase(session))
             }
+            Job::SignXades {
+                data,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                xades::sign(&data, key, &params).map(JobOutput::Signature)
+            }
+            Job::SignFacturae {
+                data,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                facturae::sign(&data, key, &params).map(JobOutput::Signature)
+            }
+            Job::SignAsic {
+                data,
+                file_name,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                match *params {
+                    AsicSignature::Cades(params) => {
+                        asic::sign_cades(&data, file_name.as_deref(), key, &params)
+                    }
+                    AsicSignature::Xades(params) => {
+                        asic::sign_xades(&data, file_name.as_deref(), key, &params)
+                    }
+                }
+                .map(JobOutput::Signature)
+            }
+            Job::TimestampRequests {
+                signed,
+                digest,
+                policy,
+            } => {
+                let imprints = tsp::signature_imprints(&signed, digest)?;
+                if imprints.is_empty() {
+                    return Err(Error::Timestamp(
+                        "la firma ya tiene sello de tiempo".to_string(),
+                    ));
+                }
+                imprints
+                    .iter()
+                    .map(|imprint| {
+                        tsp::request(digest, imprint, policy.as_deref())
+                            .map(serde_bytes::ByteBuf::from)
+                    })
+                    .collect::<Result<_>>()
+                    .map(JobOutput::TimestampRequests)
+            }
+            Job::AddTimestamps {
+                signed,
+                digest,
+                responses,
+            } => {
+                let responses: Vec<Vec<u8>> = responses
+                    .into_iter()
+                    .map(serde_bytes::ByteBuf::into_vec)
+                    .collect();
+                tsp::add_signature_timestamps(&signed, digest, &responses).map(JobOutput::Signature)
+            }
+            Job::PrepareDocumentTimestamp {
+                pdf,
+                password,
+                digest,
+                policy,
+            } => {
+                let (prepared, imprint) =
+                    pades::prepare_document_timestamp(&pdf, password.as_deref(), digest)?;
+                Ok(JobOutput::DocumentTimestamp {
+                    prepared,
+                    request: tsp::request(digest, &imprint, policy.as_deref())?,
+                })
+            }
+            Job::AddDocumentTimestamp {
+                prepared,
+                digest,
+                response,
+            } => pades::add_document_timestamp(&prepared, digest, &response)
+                .map(JobOutput::Signature),
             Job::Verify {
                 signature,
                 data,
@@ -289,10 +479,15 @@ fn analyze(data: &[u8]) -> Result<FileAnalysis> {
         return Err(Error::EmptyData);
     }
     let kind = DataKind::detect(data);
+    let default_format = if kind == DataKind::Xml && facturae::is_facturae(data) {
+        SignatureFormat::Facturae
+    } else {
+        kind.default_format()
+    };
     Ok(FileAnalysis {
         size: data.len(),
         kind,
-        default_format: kind.default_format(),
+        default_format,
         sha256: to_hex(&DigestAlgorithm::Sha256.digest(data)),
     })
 }
@@ -430,5 +625,84 @@ mod tests {
             panic!("not verified");
         };
         assert!(verification.is_valid());
+    }
+
+    #[test]
+    fn xml_asic_and_timestamp_jobs() {
+        let read = |path: &str| {
+            std::fs::read(format!(
+                "{}/../../tests/data/{path}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        let mut engine = Engine::new();
+        let Ok(JobOutput::Keys(keys)) = engine.run(Job::LoadPkcs12 {
+            data: read("certs/rsa.p12"),
+            password: "1234".to_string(),
+        }) else {
+            panic!("keystore not loaded");
+        };
+        let key_id = keys[0].id;
+
+        let Ok(JobOutput::Analysis(analysis)) = engine.run(Job::Analyze {
+            data: read("xades/factura.xml"),
+        }) else {
+            panic!("not analyzed");
+        };
+        assert_eq!(analysis.default_format, SignatureFormat::Facturae);
+
+        let time = 1_792_428_983;
+        let signatures = [
+            engine.run(Job::SignXades {
+                data: read("xades/doc.xml"),
+                key_id,
+                params: Box::new(XadesParams::new(time)),
+            }),
+            engine.run(Job::SignFacturae {
+                data: read("xades/factura.xml"),
+                key_id,
+                params: FacturaeParams::new(time),
+            }),
+            engine.run(Job::SignAsic {
+                data: read("xades/doc.txt"),
+                file_name: None,
+                key_id,
+                params: Box::new(AsicSignature::Xades(XadesParams::new(time))),
+            }),
+        ];
+        for signature in signatures {
+            let Ok(JobOutput::Signature(signed)) = signature else {
+                panic!("not signed: {signature:?}");
+            };
+            let Ok(JobOutput::TimestampRequests(requests)) = engine.run(Job::TimestampRequests {
+                signed: signed.clone(),
+                digest: DigestAlgorithm::Sha256,
+                policy: None,
+            }) else {
+                panic!("no requests");
+            };
+            let responses = requests
+                .iter()
+                .map(|request| {
+                    serde_bytes::ByteBuf::from(tsp::tests::tsa_response(request, "20261019165624Z"))
+                })
+                .collect();
+            let Ok(JobOutput::Signature(stamped)) = engine.run(Job::AddTimestamps {
+                signed,
+                digest: DigestAlgorithm::Sha256,
+                responses,
+            }) else {
+                panic!("not stamped");
+            };
+            let Ok(JobOutput::Verification(verification)) = engine.run(Job::Verify {
+                signature: stamped,
+                data: None,
+                password: None,
+            }) else {
+                panic!("not verified");
+            };
+            assert!(verification.is_valid(), "{verification:?}");
+        }
     }
 }

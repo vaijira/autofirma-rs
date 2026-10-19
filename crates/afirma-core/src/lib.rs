@@ -12,17 +12,24 @@
 )]
 
 pub mod algorithm;
+pub mod asic;
 pub mod cades;
 pub mod cert;
 pub mod digest;
 pub mod error;
+pub mod facturae;
 pub mod format;
 pub mod job;
 pub mod keystore;
 pub mod pades;
 pub mod params;
 pub mod policy;
+mod random;
+mod time;
 pub mod triphase;
+pub mod tsp;
 pub mod validation;
+pub mod xades;
+mod xml;
 
 pub use error::{Error, Result};

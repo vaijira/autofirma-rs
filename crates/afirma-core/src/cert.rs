@@ -191,6 +191,80 @@ fn any_to_string(value: &Any) -> Option<String> {
         })
 }
 
+/// Distinguished name as Java's `X500Principal.getName()` writes it (RFC 2253):
+/// most significant RDN last, the RFC 2253 keywords, and `OID=#hex` (DER of the
+/// value) for any other attribute. XAdES `X509IssuerName` uses this form.
+pub(crate) fn rfc2253(name: &Name) -> String {
+    let keyword = |attr| match attr {
+        oid::COMMON_NAME => Some("CN"),
+        oid::ORGANIZATION => Some("O"),
+        oid::ORGANIZATIONAL_UNIT => Some("OU"),
+        oid::COUNTRY => Some("C"),
+        oid::LOCALITY => Some("L"),
+        oid::STATE_OR_PROVINCE => Some("ST"),
+        oid::STREET => Some("STREET"),
+        oid::DOMAIN_COMPONENT => Some("DC"),
+        oid::USER_ID => Some("UID"),
+        _ => None,
+    };
+    let rdns: Vec<String> = name
+        .iter_rdn()
+        .map(|rdn| {
+            rdn.iter()
+                .map(|atv| match (keyword(atv.oid), any_to_string(&atv.value)) {
+                    (Some(keyword), Some(value)) => format!("{keyword}={}", escape_rfc2253(&value)),
+                    _ => format!(
+                        "{}=#{}",
+                        atv.oid,
+                        to_hex(&atv.value.to_der().unwrap_or_default())
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect();
+    rdns.into_iter().rev().collect::<Vec<_>>().join(",")
+}
+
+fn escape_rfc2253(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let last = value.chars().count().saturating_sub(1);
+    for (i, c) in value.chars().enumerate() {
+        let special = matches!(c, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
+            || (i == 0 && matches!(c, '#' | ' '))
+            || (i == last && c == ' ');
+        if special {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Decimal representation of a non-negative big-endian integer, such as a
+/// certificate serial number (XAdES `X509SerialNumber`).
+pub(crate) fn decimal(bytes: &[u8]) -> String {
+    // Repeated division by 10 of the base-256 digits.
+    let mut digits: Vec<u8> = bytes.iter().copied().skip_while(|&b| b == 0).collect();
+    let mut out = Vec::new();
+    while !digits.is_empty() {
+        let mut remainder = 0u32;
+        for digit in &mut digits {
+            let value = remainder << 8 | u32::from(*digit);
+            *digit = (value / 10) as u8;
+            remainder = value % 10;
+        }
+        out.push(b'0' + remainder as u8);
+        let zeros = digits.iter().take_while(|&&b| b == 0).count();
+        digits.drain(..zeros);
+    }
+    if out.is_empty() {
+        out.push(b'0');
+    }
+    out.reverse();
+    String::from_utf8(out).expect("ASCII digits")
+}
+
 /// DER encoding of a parsed certificate.
 pub(crate) fn to_der(cert: &Certificate) -> Result<Vec<u8>> {
     cert.to_der().map_err(|e| Error::Certificate(e.to_string()))
@@ -236,5 +310,38 @@ pub(crate) mod tests {
             info.validity_at(info.not_before - 1),
             ValidityStatus::NotYetValid
         );
+    }
+
+    #[test]
+    fn issuer_and_serial_as_java_writes_them() {
+        // Values from the XAdES signatures AutoFirma made with tests/data/certs/rsa.p12.
+        let cert = Certificate::from_der(&rsa_leaf_der()).unwrap();
+        let tbs = cert.tbs_certificate();
+        assert_eq!(
+            rfc2253(tbs.issuer()),
+            "CN=autofirma-rs Test CA,O=autofirma-rs,C=ES"
+        );
+        assert_eq!(
+            decimal(tbs.serial_number().as_bytes()),
+            "681281897908491313424016902864486774806850729136"
+        );
+        // Java prints attributes without an RFC 2253 keyword (SN, GN, serialNumber)
+        // as OID=#hex of their DER value.
+        assert_eq!(
+            rfc2253(tbs.subject()),
+            "CN=ESPAÑOL ESPAÑOL JUAN - 99999999R,2.5.4.4=#0c0845535041c3914f4c,\
+             2.5.4.42=#0c044a55414e,2.5.4.5=#130f49444345532d393939393939393952,\
+             O=autofirma-rs,C=ES"
+        );
+    }
+
+    #[test]
+    fn decimal_and_escaping() {
+        assert_eq!(decimal(&[]), "0");
+        assert_eq!(decimal(&[0, 0]), "0");
+        assert_eq!(decimal(&[0x01, 0x00]), "256");
+        assert_eq!(decimal(&[0xff; 8]), u64::MAX.to_string());
+        assert_eq!(escape_rfc2253(" a,b+c "), "\\ a\\,b\\+c\\ ");
+        assert_eq!(escape_rfc2253("#x"), "\\#x");
     }
 }

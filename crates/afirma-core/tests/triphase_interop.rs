@@ -18,6 +18,7 @@ use std::{
 
 use afirma_core::{
     digest::DigestAlgorithm,
+    facturae::FacturaeParams,
     keystore::{SigningKey, load_pkcs12},
     pades::{Font, PadesParams, Rect, SignaturePages, VisibleSignature},
     params::ExtraParams,
@@ -26,6 +27,7 @@ use afirma_core::{
         parse_presign_response,
     },
     validation::{self, Verification},
+    xades::{ProductionPlace, XadesFormat, XadesParams},
 };
 
 fn repo() -> PathBuf {
@@ -146,6 +148,51 @@ fn signs_with_the_autofirma_triphase_server() {
         let mut params = ExtraParams::default();
         params.set("mode", "implicit");
         let signature = triphase_sign(key, TriphaseFormat::Cades, b"Hola triphase\n", params);
+        let verification = validation::verify(&signature, None, None).unwrap();
+        assert!(verification.is_valid(), "{keystore}: {verification:?}");
+
+        // XAdES (XAdEStri), every format, XML and binary data.
+        let xml = std::fs::read(repo().join("tests/data/xades/doc.xml")).unwrap();
+        for format in [
+            XadesFormat::Enveloping,
+            XadesFormat::Enveloped,
+            XadesFormat::Detached,
+        ] {
+            for data in [&xml[..], b"Hola triphase\n"] {
+                if format == XadesFormat::Enveloped && data != &xml[..] {
+                    continue;
+                }
+                let params = XadesParams {
+                    format,
+                    production_place: ProductionPlace {
+                        city: Some("Madrid".to_string()),
+                        ..ProductionPlace::default()
+                    },
+                    ..XadesParams::new(0)
+                };
+                let signature =
+                    triphase_sign(key, TriphaseFormat::Xades, data, ExtraParams::from(&params));
+                let Verification::Xades(report) =
+                    validation::verify(&signature, None, None).unwrap()
+                else {
+                    panic!("not XML");
+                };
+                assert!(report.is_valid(), "{keystore} {format:?}: {report:?}");
+                assert_eq!(
+                    report.signatures[0].production_city.as_deref(),
+                    Some("Madrid")
+                );
+            }
+        }
+
+        // FacturaE.
+        let invoice = std::fs::read(repo().join("tests/data/xades/factura.xml")).unwrap();
+        let signature = triphase_sign(
+            key,
+            TriphaseFormat::Facturae,
+            &invoice,
+            ExtraParams::from(&FacturaeParams::new(0)),
+        );
         let verification = validation::verify(&signature, None, None).unwrap();
         assert!(verification.is_valid(), "{keystore}: {verification:?}");
     }

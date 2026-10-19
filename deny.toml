@@ -18,8 +18,9 @@ exceptions = [
   { allow = ["GPL-2.0-only"], crate = "afirma-web" },
   { allow = ["GPL-2.0-only"], crate = "afirma-worker" },
   { allow = ["GPL-2.0-only"], crate = "afirma-e2e" },
-  # Apache-2.0 only. Required by RustCrypto `der` 0.7 (cms, x509-cert, spki, pkcs8...),
-  # so it is shipped in the wasm bundle. Pending license decision, see PLAN.md §6.
+  # Apache-2.0 only. Required by the `alloc` feature of RustCrypto `der` 0.8, which
+  # x509-cert, cms and pkcs12 need, so it is shipped in the wasm bundle. Pending
+  # license decision, see PLAN.md §6.
   { allow = ["Apache-2.0"], crate = "flagset" },
 ]
 

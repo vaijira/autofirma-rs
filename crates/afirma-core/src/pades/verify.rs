@@ -7,6 +7,7 @@ use super::{CertificationLevel, dict_get, form_fields, load, pdf};
 use crate::{
     cades::{self, SignerReport, SignerStatus},
     error::{Error, Result},
+    tsp,
 };
 
 /// Result of verifying one signature of a PDF.
@@ -139,12 +140,21 @@ fn verify_signature(
             })
         });
 
-    let report = cades::verify(cms, Some(&signed))?;
-    let signer = report
+    // Document timestamps (ETSI.RFC3161) hold a timestamp token over the
+    // signed bytes; signatures, a CMS signature of them.
+    let document_timestamp = sub_filter == "ETSI.RFC3161";
+    let report = cades::verify(cms, (!document_timestamp).then_some(&signed[..]))?;
+    let mut signer = report
         .signers
         .into_iter()
         .next()
         .ok_or_else(|| invalid("la firma CMS no tiene firmantes"))?;
+    if document_timestamp {
+        let timestamp = tsp::verify_token(cms, |digest| Ok(digest.digest(&signed)));
+        signer.signing_time = timestamp.time;
+        signer.status = timestamp.status.clone();
+        signer.timestamps = vec![timestamp];
+    }
 
     Ok(PdfSignatureReport {
         field,
@@ -353,7 +363,7 @@ fn decode_hex(hex: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The first DER TLV of `bytes`, dropping the zero padding of `/Contents`.
-fn der_prefix(bytes: &[u8]) -> Option<&[u8]> {
+pub(super) fn der_prefix(bytes: &[u8]) -> Option<&[u8]> {
     let first = *bytes.get(1)?;
     let (header, len) = if first < 0x80 {
         (2, usize::from(first))

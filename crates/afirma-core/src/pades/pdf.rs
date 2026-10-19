@@ -5,6 +5,9 @@
 
 use lopdf::{Dictionary, Object, StringFormat};
 
+pub(crate) use crate::time::DateTime;
+use crate::time::days_from_civil;
+
 /// Appends the PDF syntax of `object` to `out`.
 pub(crate) fn write_object(out: &mut Vec<u8>, object: &Object) {
     match object {
@@ -131,50 +134,7 @@ pub(crate) fn decode_text_string(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
-/// Civil date and time in a given UTC offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DateTime {
-    pub year: i64,
-    pub month: u32,
-    pub day: u32,
-    pub hour: u32,
-    pub minute: u32,
-    pub second: u32,
-    /// Day of the week, 0 = Monday.
-    pub weekday: u32,
-    /// Offset from UTC in minutes.
-    pub offset_minutes: i32,
-}
-
 impl DateTime {
-    /// Converts a Unix time to the civil time at `offset_minutes` from UTC.
-    pub fn from_unix(unix_seconds: i64, offset_minutes: i32) -> Self {
-        let local = unix_seconds + i64::from(offset_minutes) * 60;
-        let days = local.div_euclid(86_400);
-        let secs = local.rem_euclid(86_400);
-        // Howard Hinnant's civil_from_days.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-        let year = yoe + era * 400 + i64::from(month <= 2);
-        DateTime {
-            year,
-            month,
-            day,
-            hour: (secs / 3600) as u32,
-            minute: (secs % 3600 / 60) as u32,
-            second: (secs % 60) as u32,
-            // 1970-01-01 was a Thursday.
-            weekday: (days + 3).rem_euclid(7) as u32,
-            offset_minutes,
-        }
-    }
-
     /// PDF date string (`D:20261016160754+02'00'`).
     pub fn to_pdf(self) -> String {
         let sign = if self.offset_minutes < 0 { '-' } else { '+' };
@@ -229,16 +189,6 @@ pub(crate) fn parse_pdf_date(text: &str) -> Option<i64> {
         days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
             - offset * 60,
     )
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]

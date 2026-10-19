@@ -128,7 +128,8 @@ impl VerifyPage {
             .children(&mut [
                 html!("h2", { .text("Verificar") }),
                 html!("p", {
-                    .text("Compruebe la integridad de una firma CAdES (.csig, .p7s) o de las firmas de un PDF. \
+                    .text("Compruebe la integridad de una firma CAdES (.csig, .p7s), XAdES o FacturaE (.xsig, .xml), \
+                           de un contenedor ASiC-S (.asics) o de las firmas de un PDF. \
                            Se verifica que los datos no han cambiado y que la firma corresponde al certificado; \
                            no se consulta la confianza ni la revocación del certificado.")
                 }),
@@ -139,7 +140,7 @@ impl VerifyPage {
                 Missing::SignedData => Some(html!("div", {
                     .style("margin", "1rem 0")
                     .children(&mut [
-                        html!("p", { .text("Es una firma explícita: seleccione también el fichero que se firmó.") }),
+                        html!("p", { .text("Es una firma separada de los datos: seleccione también el fichero que se firmó.") }),
                         FilePicker::render(&data_picker),
                     ])
                 })),
@@ -178,35 +179,7 @@ impl VerifyPage {
     }
 
     fn render_result(verification: &Verification) -> Dom {
-        let (summary, cards): (String, Vec<Dom>) = match verification {
-            Verification::Cades(report) => (
-                format!(
-                    "Firma CAdES {} con {} firmante(s).",
-                    if report.implicit {
-                        "implícita"
-                    } else {
-                        "explícita"
-                    },
-                    report.signers.len()
-                ),
-                report
-                    .signers
-                    .iter()
-                    .map(|signer| render_signer(signer, None))
-                    .collect(),
-            ),
-            Verification::Pades(report) if report.signatures.is_empty() => {
-                ("El PDF no contiene firmas.".to_string(), Vec::new())
-            }
-            Verification::Pades(report) => (
-                format!("El PDF contiene {} firma(s).", report.signatures.len()),
-                report
-                    .signatures
-                    .iter()
-                    .map(|signature| render_signer(&signature.signer, Some(signature)))
-                    .collect(),
-            ),
-        };
+        let (summary, cards) = describe(verification);
         let valid = verification.is_valid();
 
         html!("div", {
@@ -229,6 +202,69 @@ impl VerifyPage {
     }
 }
 
+/// Summary and one card per signature.
+fn describe(verification: &Verification) -> (String, Vec<Dom>) {
+    match verification {
+        Verification::Cades(report) => (
+            format!(
+                "Firma CAdES {} con {} firmante(s).",
+                if report.implicit {
+                    "implícita"
+                } else {
+                    "explícita"
+                },
+                report.signers.len()
+            ),
+            report
+                .signers
+                .iter()
+                .map(|signer| render_signer(signer, None, &[]))
+                .collect(),
+        ),
+        Verification::Pades(report) if report.signatures.is_empty() => {
+            ("El PDF no contiene firmas.".to_string(), Vec::new())
+        }
+        Verification::Pades(report) => (
+            format!("El PDF contiene {} firma(s).", report.signatures.len()),
+            report
+                .signatures
+                .iter()
+                .map(|signature| render_signer(&signature.signer, Some(signature), &[]))
+                .collect(),
+        ),
+        Verification::Xades(report) => (
+            format!("Documento XML con {} firma(s).", report.signatures.len()),
+            report
+                .signatures
+                .iter()
+                .map(|signature| {
+                    let mut extra = vec![(
+                        "Formato",
+                        if signature.xades { "XAdES" } else { "XMLDSig" }.to_string(),
+                    )];
+                    if !signature.claimed_roles.is_empty() {
+                        extra.push(("Papel", signature.claimed_roles.join(", ")));
+                    }
+                    if let Some(city) = &signature.production_city {
+                        extra.push(("Lugar", city.clone()));
+                    }
+                    render_signer(&signature.signer, None, &extra)
+                })
+                .collect(),
+        ),
+        Verification::Asic(report) => {
+            let (summary, cards) = describe(&report.signature);
+            (
+                format!(
+                    "Contenedor ASiC-S con el fichero «{}». {summary}",
+                    report.file_name
+                ),
+                cards,
+            )
+        }
+    }
+}
+
 fn status_text(status: &SignerStatus) -> String {
     match status {
         SignerStatus::Valid => "Válida".to_string(),
@@ -239,12 +275,21 @@ fn status_text(status: &SignerStatus) -> String {
         SignerStatus::CertificateNotFound => {
             "No se puede comprobar: falta el certificado".to_string()
         }
+        SignerStatus::CertificateMismatch => {
+            "No válida: el certificado incluido no es el que se firmó".to_string()
+        }
         SignerStatus::Unsupported(what) => format!("No se puede comprobar: {what} no soportado"),
     }
 }
 
-fn render_signer(signer: &SignerReport, pdf: Option<&PdfSignatureReport>) -> Dom {
+fn render_signer(
+    signer: &SignerReport,
+    pdf: Option<&PdfSignatureReport>,
+    extra: &[(&'static str, String)],
+) -> Dom {
+    let document_timestamp = pdf.is_some_and(|p| p.sub_filter == "ETSI.RFC3161");
     let mut rows: Vec<(&str, String)> = vec![("Estado", status_text(&signer.status))];
+    rows.extend(extra.iter().cloned());
     if let Some(cert) = &signer.certificate {
         rows.push(("Firmante", cert.subject_cn.clone()));
         rows.push(("Emisor", cert.issuer_cn.clone()));
@@ -256,14 +301,43 @@ fn render_signer(signer: &SignerReport, pdf: Option<&PdfSignatureReport>) -> Dom
         .signing_time
         .or_else(|| pdf.and_then(|p| p.claimed_time));
     if let Some(time) = time {
-        rows.push(("Fecha declarada", format_date_time(time)));
+        rows.push((
+            if document_timestamp {
+                "Fecha del sello"
+            } else {
+                "Fecha declarada"
+            },
+            format_date_time(time),
+        ));
+    }
+    if !document_timestamp {
+        for timestamp in &signer.timestamps {
+            let mut text = match timestamp.time {
+                Some(time) => format_date_time(time),
+                None => "sin fecha".to_string(),
+            };
+            if let Some(tsa) = &timestamp.tsa {
+                text.push_str(&format!(" ({tsa})"));
+            }
+            if timestamp.status != SignerStatus::Valid {
+                text.push_str(&format!(" — {}", status_text(&timestamp.status)));
+            }
+            rows.push(("Sello de tiempo", text));
+        }
     }
     if let Some(policy) = &signer.policy {
         rows.push(("Política", policy.clone()));
     }
     if let Some(pdf) = pdf {
         rows.push(("Campo", pdf.field.clone()));
-        rows.push(("Tipo", pdf.sub_filter.clone()));
+        rows.push((
+            "Tipo",
+            if document_timestamp {
+                "sello de tiempo del documento (ETSI.RFC3161)".to_string()
+            } else {
+                pdf.sub_filter.clone()
+            },
+        ));
         if let Some(reason) = &pdf.reason {
             rows.push(("Motivo", reason.clone()));
         }
