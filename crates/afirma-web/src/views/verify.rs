@@ -9,61 +9,61 @@ use afirma_core::{
     validation::Verification,
     xades::XadesVerifyReport,
 };
-use dominator::{Dom, clone, events, html, with_node};
+use dominator::{Dom, clone, html};
 use futures_signals::signal::{Mutable, SignalExt};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlInputElement;
 
 use crate::{
     components::file_picker::{FilePicker, LoadedFile},
-    css::{CARD_CLASS, ERROR_CLASS},
+    css::{
+        CARD_CLASS, CARD_TITLE_CLASS, CHIP_CLASS, DETAILS_LIST_CLASS, ERROR_CLASS, STATUS_CLASS,
+        TILE_CLASS, VERDICT_CLASS,
+    },
     state::format_date_time,
     worker::WorkerClient,
 };
 
-/// What the verification still needs from the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Missing {
-    Nothing,
-    /// Explicit CAdES signature: the signed file.
-    SignedData,
-    /// Encrypted PDF: its password.
-    Password,
-}
-
-/// "Verificar" view: checks the integrity of signatures and signed documents.
+/// Checks the integrity of a signature or signed document as soon as it is
+/// opened, asking for the signed data of detached signatures.
 #[derive(Debug)]
-pub struct VerifyPage {
+pub struct Verifier {
     worker: Rc<WorkerClient>,
-    signature: Mutable<Option<Rc<LoadedFile>>>,
+    signature: Rc<LoadedFile>,
     data: Mutable<Option<Rc<LoadedFile>>>,
+    /// Password of an encrypted PDF, shared with the signing panel.
     password: Mutable<Option<String>>,
-    missing: Mutable<Missing>,
+    /// Set when the PDF turns out to be encrypted.
+    needs_password: Mutable<bool>,
+    missing_data: Mutable<bool>,
     result: Mutable<Option<Rc<Verification>>>,
     busy: Mutable<bool>,
     error: Mutable<Option<String>>,
 }
 
-impl VerifyPage {
-    pub fn new(worker: Rc<WorkerClient>) -> Rc<Self> {
+impl Verifier {
+    pub fn new(
+        worker: Rc<WorkerClient>,
+        signature: Rc<LoadedFile>,
+        data: Option<Rc<LoadedFile>>,
+        password: Mutable<Option<String>>,
+        needs_password: Mutable<bool>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             worker,
-            signature: Mutable::new(None),
-            data: Mutable::new(None),
-            password: Mutable::new(None),
-            missing: Mutable::new(Missing::Nothing),
+            signature,
+            data: Mutable::new(data),
+            password,
+            needs_password,
+            missing_data: Mutable::new(false),
             result: Mutable::new(None),
             busy: Mutable::new(false),
             error: Mutable::new(None),
         })
     }
 
-    fn verify(this: &Rc<Self>) {
-        let Some(signature) = this.signature.get_cloned() else {
-            return;
-        };
+    pub fn verify(this: &Rc<Self>) {
         let job = Job::Verify {
-            signature: signature.data.clone(),
+            signature: this.signature.data.clone(),
             data: this.data.get_cloned().map(|file| file.data.clone()),
             password: this.password.get_cloned(),
         };
@@ -73,23 +73,20 @@ impl VerifyPage {
         spawn_local(clone!(this => async move {
             match this.worker.run(job).await {
                 Ok(JobOutput::Verification(verification)) => {
-                    this.missing.set(Missing::Nothing);
+                    this.missing_data.set(false);
                     this.result.set(Some(Rc::new(verification)));
                 }
                 Ok(other) => log::error!("Unexpected worker output: {other:?}"),
                 Err(err) => {
                     let message = err.to_string();
-                    let missing = if message == CoreError::MissingSignedData.to_string() {
-                        Missing::SignedData
+                    if message == CoreError::MissingSignedData.to_string() {
+                        this.missing_data.set(true);
                     } else if message == CoreError::PdfPasswordRequired.to_string()
                         || message == CoreError::WrongPdfPassword.to_string()
                     {
-                        Missing::Password
+                        // The document asks for the password and reports wrong ones.
+                        this.needs_password.set_neq(true);
                     } else {
-                        Missing::Nothing
-                    };
-                    this.missing.set(missing);
-                    if missing == Missing::Nothing || this.password.lock_ref().is_some() {
                         this.error.set(Some(message));
                     }
                 }
@@ -99,23 +96,9 @@ impl VerifyPage {
     }
 
     pub fn render(this: &Rc<Self>) -> Dom {
-        let signature_picker = FilePicker::new(
-            "verify_file",
-            "Seleccionar firma o documento firmado",
-            "*/*",
-            clone!(this => move |result| match result {
-                Ok(file) => {
-                    this.signature.set(Some(Rc::new(file)));
-                    this.data.set(None);
-                    this.password.set(None);
-                    Self::verify(&this);
-                }
-                Err(err) => this.error.set(Some(err)),
-            }),
-        );
         let data_picker = FilePicker::new(
             "verify_data",
-            "Seleccionar fichero firmado",
+            "Seleccionar el fichero firmado",
             "*/*",
             clone!(this => move |result| match result {
                 Ok(file) => {
@@ -127,82 +110,63 @@ impl VerifyPage {
         );
 
         html!("section", {
-            .children(&mut [
-                html!("h2", { .text("Verificar") }),
-                html!("p", {
-                    .text("Compruebe la integridad de una firma CAdES (.csig, .p7s), XAdES o FacturaE (.xsig, .xml), \
-                           de un contenedor ASiC-S (.asics) o de las firmas de un PDF o de un documento \
-                           OpenDocument (.odt, .ods, .odp) u Office (.docx, .xlsx, .pptx). \
-                           Se verifica que los datos no han cambiado y que la firma corresponde al certificado; \
-                           no se consulta la confianza ni la revocación del certificado.")
-                }),
-                FilePicker::render(&signature_picker),
-            ])
-            .child_signal(this.missing.signal().map(clone!(this, data_picker => move |missing| match missing {
-                Missing::Nothing => None,
-                Missing::SignedData => Some(html!("div", {
-                    .style("margin", "1rem 0")
-                    .children(&mut [
-                        html!("p", { .text("Es una firma separada de los datos: seleccione también el fichero que se firmó.") }),
-                        FilePicker::render(&data_picker),
-                    ])
-                })),
-                Missing::Password => Some(Self::render_password(&this)),
-            })))
-            .child_signal(this.busy.signal().map(|busy| busy.then(|| html!("p", { .attr("role", "status").text("Verificando…") }))))
+            .class(&*CARD_CLASS)
+            .attr("id", "verify_card")
+            .attr("aria-labelledby", "verify_title")
+            .child(html!("h2", { .attr("id", "verify_title").class(&*CARD_TITLE_CLASS).text("Verificación") }))
+            .child_signal(this.missing_data.signal().map(move |missing| missing.then(|| html!("div", {
+                .children(&mut [
+                    html!("p", {
+                        .style("margin-top", "0")
+                        .text("Es una firma separada de los datos: para comprobarla, seleccione también el \
+                               fichero que se firmó.")
+                    }),
+                    FilePicker::render(&data_picker),
+                ])
+            }))))
+            .child_signal(this.busy.signal().map(|busy| {
+                busy.then(|| html!("p", { .class(&*STATUS_CLASS).attr("role", "status").text("Verificando…") }))
+            }))
             .child_signal(this.error.signal_cloned().map(|error| {
                 error.map(|error| html!("p", { .class(&*ERROR_CLASS).attr("role", "alert").text(&error) }))
             }))
-            .child_signal(this.result.signal_cloned().map(|result| result.map(|result| Self::render_result(&result))))
-        })
-    }
-
-    fn render_password(this: &Rc<Self>) -> Dom {
-        let password = Mutable::new(String::new());
-        html!("form", {
-            .style("margin", "1rem 0")
-            .event_with_options(&dominator::EventOptions::preventable(), clone!(this, password => move |event: events::Submit| {
-                event.prevent_default();
-                this.password.set(Some(password.get_cloned()));
-                Self::verify(&this);
+            .child_signal(this.result.signal_cloned().map(|result| result.map(|result| render_result(&result))))
+            .child(html!("p", {
+                .class(&*crate::css::MUTED_CLASS)
+                .style("margin-top", "1rem")
+                .text("Se comprueba que los datos no han cambiado y que cada firma corresponde a su \
+                       certificado; no se consulta la confianza ni la revocación de los certificados.")
             }))
-            .children(&mut [
-                html!("label", { .attr("for", "verify_password").text("El PDF está protegido. Contraseña: ") }),
-                html!("input" => HtmlInputElement, {
-                    .attr("type", "password")
-                    .attr("id", "verify_password")
-                    .attr("autocomplete", "off")
-                    .with_node!(element => {
-                        .event(clone!(password => move |_: events::Input| password.set(element.value())))
-                    })
-                }),
-                html!("button", { .attr("type", "submit").attr("id", "verify_unlock").text("Abrir") }),
-            ])
         })
     }
+}
 
-    fn render_result(verification: &Verification) -> Dom {
-        let (summary, cards) = describe(verification);
-        let valid = verification.is_valid();
+fn render_result(verification: &Verification) -> Dom {
+    let (summary, cards) = describe(verification);
+    let valid = verification.is_valid();
 
-        html!("div", {
-            .attr("id", "verify_result")
-            .attr("role", "status")
-            .style("margin-top", "1rem")
-            .children(&mut [
-                html!("p", {
-                    .attr("id", "verify_summary")
-                    .style("font-weight", "600")
-                    .style("color", if valid { "var(--ok, #1b7a2f)" } else { "#ba3939" })
-                    .text(&format!(
-                        "{} {summary}",
-                        if valid { "✔ Firmas válidas." } else { "✘ Hay firmas no válidas." }
-                    ))
-                }),
-            ])
-            .children(cards)
-        })
-    }
+    html!("div", {
+        .attr("id", "verify_result")
+        .attr("role", "status")
+        .children(&mut [
+            html!("p", {
+                .attr("id", "verify_summary")
+                .class(&*VERDICT_CLASS)
+                .style("color", if valid { "var(--ok)" } else { "var(--danger)" })
+                .style("background", if valid { "var(--ok-soft)" } else { "var(--danger-soft)" })
+                .children(&mut [
+                    html!("span", { .attr("aria-hidden", "true").text(if valid { "✔" } else { "✘" }) }),
+                    html!("span", {
+                        .text(&format!(
+                            "{} {summary}",
+                            if valid { "Firmas válidas." } else { "Hay firmas no válidas." }
+                        ))
+                    }),
+                ])
+            }),
+        ])
+        .children(cards)
+    })
 }
 
 /// Summary and one card per signature.
@@ -308,7 +272,7 @@ fn describe_package(kind: &str, report: &PackageReport) -> (String, Vec<Dom>) {
     if !report.unsigned_parts.is_empty() {
         summary.push_str(" Hay partes del documento sin firmar.");
         cards.push(html!("article", {
-            .class(&*CARD_CLASS)
+            .class(&*TILE_CLASS)
             .attr("id", "verify_unsigned_parts")
             .attr("data-status", "invalid")
             .children(&mut [
@@ -349,19 +313,14 @@ fn render_signer(
     extra: &[(&'static str, String)],
 ) -> Dom {
     let document_timestamp = pdf.is_some_and(|p| p.sub_filter == "ETSI.RFC3161");
-    let mut rows: Vec<(&str, String)> = vec![("Estado", status_text(&signer.status))];
-    if signer.depth > 0 {
-        rows.push((
-            "Tipo",
-            match signer.depth {
-                1 => "Contrafirma".to_string(),
-                depth => format!("Contrafirma de nivel {depth}"),
-            },
-        ));
-    }
-    rows.extend(extra.iter().cloned());
+    let valid = signer.status == SignerStatus::Valid;
+    let badge = match signer.depth {
+        0 => None,
+        1 => Some("Contrafirma".to_string()),
+        depth => Some(format!("Contrafirma de nivel {depth}")),
+    };
+    let mut rows: Vec<(&str, String)> = extra.to_vec();
     if let Some(cert) = &signer.certificate {
-        rows.push(("Firmante", cert.subject_cn.clone()));
         rows.push(("Emisor", cert.issuer_cn.clone()));
     }
     if let Some(digest) = signer.digest {
@@ -440,7 +399,7 @@ fn render_signer(
     }
 
     html!("article", {
-        .class(&*CARD_CLASS)
+        .class(&*TILE_CLASS)
         // Counter-signatures under the signature they sign.
         .style("margin-left", &format!("{}rem", 1.5 * signer.depth.min(4) as f32))
         .attr("data-depth", &signer.depth.to_string())
@@ -448,12 +407,39 @@ fn render_signer(
             SignerStatus::Valid => "valid",
             _ => "invalid",
         })
+        .child(html!("div", {
+            .style("display", "flex")
+            .style("align-items", "baseline")
+            .style("gap", "0.5rem")
+            .children(&mut [
+                html!("span", {
+                    .attr("aria-hidden", "true")
+                    .style("color", if valid { "var(--ok)" } else { "var(--danger)" })
+                    .text(if valid { "✔" } else { "✘" })
+                }),
+                html!("span", {
+                    .style("font-weight", "600")
+                    .style("flex", "1")
+                    .style("word-break", "break-word")
+                    .text(signer.certificate.as_ref().map_or("Firmante desconocido", |cert| cert.subject_cn.as_str()))
+                }),
+            ])
+            .apply_if(badge.is_some(), |dom| dom.child(html!("span", {
+                .class(&*CHIP_CLASS)
+                .style("font-size", "0.75rem")
+                .text(badge.as_deref().unwrap_or_default())
+            })))
+        }))
+        .child(html!("p", {
+            .style("margin", "0.15rem 0 0.5rem 1.4rem")
+            .style("font-size", "0.875rem")
+            .style("color", if valid { "var(--ok)" } else { "var(--danger)" })
+            .text(&status_text(&signer.status))
+        }))
         .child(html!("dl", {
-            .style("display", "grid")
-            .style("grid-template-columns", "max-content 1fr")
-            .style("gap", "0.15rem 1rem")
-            .style("margin", "0")
-            .style("word-break", "break-word")
+            .class(&*DETAILS_LIST_CLASS)
+            .style("margin-left", "1.4rem")
+            .style("font-size", "0.875rem")
             .children(rows.into_iter().flat_map(|(name, value)| {
                 [
                     html!("dt", { .style("color", "var(--muted)").text(name) }),

@@ -23,6 +23,7 @@ gloo-file = { version = "0.4", features = ["futures"] }
 gloo-utils = "0.3"
 js-sys.workspace = true
 log.workspace = true
+serde.workspace = true
 serde-wasm-bindgen.workspace = true
 serde_bytes.workspace = true
 wasm-bindgen.workspace = true
@@ -34,6 +35,7 @@ version = "0.3"
 features = [
   "Blob",
   "BlobPropertyBag",
+  "DataTransfer",
   "Document",
   "DomRect",
   "Element",
@@ -41,6 +43,7 @@ features = [
   "FileList",
   "Headers",
   "HtmlAnchorElement",
+  "HtmlDialogElement",
   "HtmlElement",
   "HtmlInputElement",
   "HtmlSelectElement",
@@ -48,6 +51,7 @@ features = [
   "MessageEvent",
   "RequestInit",
   "Response",
+  "Storage",
   "Url",
   "Window",
   "Worker",

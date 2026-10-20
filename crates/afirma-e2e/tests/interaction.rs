@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use thirtyfour::prelude::*;
+use thirtyfour::{prelude::*, stringmatch::StringMatch};
 
 const APP_URL: &str = "http://localhost:8080/";
 const WEBDRIVER_URL: &str = "http://localhost:4444";
@@ -13,15 +13,17 @@ fn test_data() -> String {
 
 /// Chrome by default (docker-compose); `E2E_BROWSER=firefox` for a local geckodriver.
 async fn driver() -> WebDriverResult<WebDriver> {
-    if std::env::var("E2E_BROWSER").as_deref() == Ok("firefox") {
+    let driver = if std::env::var("E2E_BROWSER").as_deref() == Ok("firefox") {
         let mut caps = DesiredCapabilities::firefox();
         caps.set_headless()?;
-        WebDriver::new(WEBDRIVER_URL, caps).await
+        WebDriver::new(WEBDRIVER_URL, caps).await?
     } else {
         let mut caps = DesiredCapabilities::chrome();
         caps.set_headless()?;
-        WebDriver::new(WEBDRIVER_URL, caps).await
-    }
+        WebDriver::new(WEBDRIVER_URL, caps).await?
+    };
+    driver.goto(APP_URL).await?;
+    Ok(driver)
 }
 
 /// Waits for an element; prints the page source if it never shows up.
@@ -40,32 +42,73 @@ async fn wait(driver: &WebDriver, by: By) -> WebDriverResult<WebElement> {
     }
 }
 
-#[tokio::test]
-#[ignore]
-async fn analyzes_a_pdf_in_the_worker() -> WebDriverResult<()> {
-    let driver = driver().await?;
-    driver.goto(APP_URL).await?;
-
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/pades/doc.pdf", test_data()))
-        .await?;
-
-    let sha256 = wait(&driver, By::Css("#file_sha256 td")).await?;
-    assert_eq!(sha256.text().await?.len(), 64);
-    let format = driver
-        .find(By::Css("#file_format td"))
-        .await?
-        .text()
-        .await?;
-    assert_eq!(format, "PAdES");
-
-    driver.quit().await
+/// Waits for an element whose text contains `text`; returns its text, or the
+/// current text if it never matches (so the assertion shows it).
+async fn wait_text(driver: &WebDriver, id: &str, text: &str) -> WebDriverResult<String> {
+    let found = driver
+        .query(By::Id(id))
+        .with_text(StringMatch::new(text).partial())
+        .wait(Duration::from_secs(10), Duration::from_millis(200))
+        .first()
+        .await;
+    match found {
+        Ok(element) => element.text().await,
+        Err(_) => wait(driver, By::Id(id)).await?.text().await,
+    }
 }
 
-/// Imports `certs/rsa.p12` in the "Certificados" view, trying a wrong password first.
+/// Opens files as if chosen with "Seleccionar ficheros" (one path per file).
+async fn open_files(driver: &WebDriver, files: &[&str]) -> WebDriverResult<()> {
+    let paths: Vec<String> = files
+        .iter()
+        .map(|file| format!("{}/{file}", test_data()))
+        .collect();
+    wait(driver, By::Id("file_input"))
+        .await?
+        .send_keys(paths.join("\n"))
+        .await
+}
+
+/// Opens one file and waits until it replaces the previous one.
+async fn open_one(driver: &WebDriver, file: &str) -> WebDriverResult<()> {
+    open_files(driver, &[file]).await?;
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let shown = wait_text(driver, "file_name", name).await?;
+    assert_eq!(shown, name);
+    Ok(())
+}
+
+/// Opens one file and waits for its sign panel.
+async fn open_file(driver: &WebDriver, file: &str) -> WebDriverResult<()> {
+    open_one(driver, file).await?;
+    wait(driver, By::Id("sign_button")).await?;
+    Ok(())
+}
+
+/// Unfolds "Personalizar" in the sign panel.
+async fn customize(driver: &WebDriver) -> WebDriverResult<()> {
+    let details = wait(driver, By::Id("sign_customize")).await?;
+    if details.attr("open").await?.is_none() {
+        details.find(By::Tag("summary")).await?.click().await?;
+    }
+    Ok(())
+}
+
+/// Selects `value` in the `<select>` with `id`.
+async fn choose(driver: &WebDriver, id: &str, value: &str) -> WebDriverResult<()> {
+    wait(driver, By::Id(id))
+        .await?
+        .find(By::Css(format!("option[value='{value}']")))
+        .await?
+        .click()
+        .await
+}
+
+/// Imports `certs/rsa.p12` from the header button, trying a wrong password first.
 async fn import_certificate(driver: &WebDriver) -> WebDriverResult<()> {
-    driver.goto(format!("{APP_URL}#/certs")).await?;
+    let button = wait(driver, By::Id("cert_button")).await?;
+    assert!(button.text().await?.contains("Importar certificado"));
+    button.click().await?;
 
     wait(driver, By::Id("import_p12"))
         .await?
@@ -78,7 +121,7 @@ async fn import_certificate(driver: &WebDriver) -> WebDriverResult<()> {
         .send_keys("bad")
         .await?;
     driver.find(By::Id("p12_unlock")).await?.click().await?;
-    let error = wait(driver, By::Css("form[role=dialog] [role=alert]")).await?;
+    let error = wait(driver, By::Css("#p12_form [role=alert]")).await?;
     assert!(error.text().await?.contains("contraseña"));
 
     let password = driver.find(By::Id("p12_password")).await?;
@@ -86,15 +129,48 @@ async fn import_certificate(driver: &WebDriver) -> WebDriverResult<()> {
     password.send_keys("1234").await?;
     driver.find(By::Id("p12_unlock")).await?.click().await?;
 
-    let card = wait(driver, By::Css("#cert_list article")).await?;
-    assert!(card.text().await?.contains("ESPAÑOL ESPAÑOL JUAN"));
+    // The dialog closes and the header shows the certificate.
+    let name = wait_text(driver, "cert_button", "ESPAÑOL ESPAÑOL JUAN").await?;
+    assert!(name.contains("ESPAÑOL ESPAÑOL JUAN"), "{name}");
+    assert!(driver.find(By::Id("cert_dialog")).await.is_err());
     Ok(())
 }
 
-/// Text of the signature result, or of the error if signing failed.
-async fn signature_result(driver: &WebDriver) -> WebDriverResult<String> {
-    let result = wait(driver, By::Css("#signature_result, [role=alert]")).await?;
+/// Signs with the current options; returns the result, or the error if signing failed.
+async fn sign(driver: &WebDriver) -> WebDriverResult<String> {
+    driver.find(By::Id("sign_button")).await?.click().await?;
+    let result = wait(
+        driver,
+        By::Css("#signature_result, #sign_card [role=alert]"),
+    )
+    .await?;
     result.text().await
+}
+
+#[tokio::test]
+#[ignore]
+async fn analyzes_a_pdf_in_the_worker() -> WebDriverResult<()> {
+    let driver = driver().await?;
+    open_file(&driver, "pades/doc.pdf").await?;
+
+    let sha256 = driver
+        .find(By::Id("file_sha256"))
+        .await?
+        .prop("textContent")
+        .await?
+        .unwrap_or_default();
+    assert_eq!(sha256.len(), 64);
+    // The defaults are stated before anything is changed.
+    let format = wait_text(&driver, "summary_format", "PAdES").await?;
+    assert_eq!(format, "PAdES, dentro del PDF");
+    let digest = driver.find(By::Id("summary_digest")).await?.text().await?;
+    assert_eq!(digest, "SHA-512");
+    let visible = driver.find(By::Id("summary_visible")).await?.text().await?;
+    assert_eq!(visible, "Firma invisible");
+    // Unsigned: nothing to verify.
+    assert!(driver.find(By::Id("verify_card")).await.is_err());
+
+    driver.quit().await
 }
 
 #[tokio::test]
@@ -103,28 +179,40 @@ async fn imports_certificate_and_signs_cades() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
 
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/cades/doc.txt", test_data()))
-        .await?;
-    wait(&driver, By::Id("sign_button")).await?;
+    open_file(&driver, "cades/doc.txt").await?;
     let certificate = driver
         .find(By::Id("sign_certificate"))
         .await?
         .text()
         .await?;
     assert!(certificate.contains("JUAN"), "{certificate}");
-    driver.find(By::Id("sign_button")).await?.click().await?;
-
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("Firma CAdES generada"), "{result}");
-    let download = driver
-        .find(By::Id("download_signature"))
+    assert!(result.contains("doc.txt.csig"), "{result}");
+    driver.find(By::Id("download_signature")).await?;
+
+    // The new signature opens verified, with the signed data already known.
+    driver
+        .find(By::Id("verify_signature"))
         .await?
-        .text()
+        .click()
         .await?;
-    assert!(download.contains("doc.txt.csig"), "{download}");
+    let summary = wait_text(&driver, "verify_summary", "Firma CAdES explícita").await?;
+    assert!(summary.contains("Firmas válidas"), "{summary}");
+
+    driver.quit().await
+}
+
+#[tokio::test]
+#[ignore]
+async fn asks_for_a_certificate_when_signing_without_one() -> WebDriverResult<()> {
+    let driver = driver().await?;
+    open_file(&driver, "cades/doc.txt").await?;
+    let button = driver.find(By::Id("sign_button")).await?;
+    assert_eq!(button.text().await?, "Elegir certificado y firmar");
+    button.click().await?;
+    wait(&driver, By::Id("cert_dialog")).await?;
+    wait(&driver, By::Id("import_p12")).await?;
 
     driver.quit().await
 }
@@ -135,12 +223,8 @@ async fn signs_a_pdf_with_a_visible_signature() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
 
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/pades/doc-xref.pdf", test_data()))
-        .await?;
-    // PAdES is preselected for PDFs.
+    open_file(&driver, "pades/doc-xref.pdf").await?;
+    customize(&driver).await?;
     wait(&driver, By::Id("pades_options")).await?;
     driver
         .find(By::Id("sign_reason"))
@@ -150,12 +234,7 @@ async fn signs_a_pdf_with_a_visible_signature() -> WebDriverResult<()> {
     driver.find(By::Id("sign_visible")).await?.click().await?;
 
     // Page 1 of 2, and the area typed in the fields.
-    wait(&driver, By::Id("sign_page"))
-        .await?
-        .find(By::Css("option[value='1']"))
-        .await?
-        .click()
-        .await?;
+    choose(&driver, "sign_page", "1").await?;
     let width = driver.find(By::Id("sign_width")).await?;
     width.clear().await?;
     width.send_keys("250\t").await?;
@@ -164,16 +243,12 @@ async fn signs_a_pdf_with_a_visible_signature() -> WebDriverResult<()> {
         .await?
         .send_keys("Firmado por $$SUBJECTCN$$")
         .await?;
+    let visible = wait_text(&driver, "summary_visible", "página 1").await?;
+    assert_eq!(visible, "Visible en la página 1");
 
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("PDF firmado en PAdES"), "{result}");
-    let download = driver
-        .find(By::Id("download_signature"))
-        .await?
-        .text()
-        .await?;
-    assert!(download.contains("doc-xref_signed.pdf"), "{download}");
+    assert!(result.contains("doc-xref_signed.pdf"), "{result}");
 
     driver.quit().await
 }
@@ -184,11 +259,7 @@ async fn signs_an_encrypted_pdf() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
 
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/pades/doc-aes256.pdf", test_data()))
-        .await?;
+    open_file(&driver, "pades/doc-aes256.pdf").await?;
     wait(&driver, By::Id("pdf_password"))
         .await?
         .send_keys("user")
@@ -196,8 +267,7 @@ async fn signs_an_encrypted_pdf() -> WebDriverResult<()> {
     driver.find(By::Id("pdf_unlock")).await?.click().await?;
     wait(&driver, By::Id("pades_options")).await?;
 
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("PDF firmado en PAdES"), "{result}");
 
     driver.quit().await
@@ -207,53 +277,32 @@ async fn signs_an_encrypted_pdf() -> WebDriverResult<()> {
 #[ignore]
 async fn verifies_signatures() -> WebDriverResult<()> {
     let driver = driver().await?;
-    driver.goto(format!("{APP_URL}#/verify")).await?;
 
-    // Signed PDF made by AutoFirma: two signatures.
-    wait(&driver, By::Id("verify_file"))
-        .await?
-        .send_keys(format!("{}/pades/autofirma-cosign-ec.pdf", test_data()))
-        .await?;
-    let summary = wait(&driver, By::Id("verify_summary"))
-        .await?
-        .text()
-        .await?;
-    assert!(
-        summary.contains("Firmas válidas") && summary.contains("2 firma"),
-        "{summary}"
-    );
+    // Signed PDF made by AutoFirma: two signatures, verified on opening.
+    open_one(&driver, "pades/autofirma-cosign-ec.pdf").await?;
+    let summary = wait_text(&driver, "verify_summary", "2 firma").await?;
+    assert!(summary.contains("Firmas válidas"), "{summary}");
+    // And ready for one more.
+    let title = driver.find(By::Id("sign_title")).await?.text().await?;
+    assert_eq!(title, "Añadir su firma");
 
     // Explicit CAdES: asks for the signed file.
-    driver
-        .find(By::Id("verify_file"))
-        .await?
-        .send_keys(format!("{}/cades/autofirma-explicit-rsa.csig", test_data()))
-        .await?;
+    open_one(&driver, "cades/autofirma-explicit-rsa.csig").await?;
     wait(&driver, By::Id("verify_data"))
         .await?
         .send_keys(format!("{}/cades/doc.txt", test_data()))
         .await?;
-    let summary = wait(&driver, By::Id("verify_summary"))
-        .await?
-        .text()
-        .await?;
-    assert!(summary.contains("Firma CAdES explícita"), "{summary}");
+    let summary = wait_text(&driver, "verify_summary", "Firma CAdES explícita").await?;
+    assert!(summary.contains("Firmas válidas"), "{summary}");
 
     // Encrypted PDF: asks for the password.
-    driver
-        .find(By::Id("verify_file"))
-        .await?
-        .send_keys(format!("{}/pades/autofirma-aes256-rsa.pdf", test_data()))
-        .await?;
-    wait(&driver, By::Id("verify_password"))
+    open_one(&driver, "pades/autofirma-aes256-rsa.pdf").await?;
+    wait(&driver, By::Id("pdf_password"))
         .await?
         .send_keys("user")
         .await?;
-    driver.find(By::Id("verify_unlock")).await?.click().await?;
-    let summary = wait(&driver, By::Id("verify_summary"))
-        .await?
-        .text()
-        .await?;
+    driver.find(By::Id("pdf_unlock")).await?.click().await?;
+    let summary = wait_text(&driver, "verify_summary", "Firmas válidas").await?;
     assert!(summary.contains("Firmas válidas"), "{summary}");
 
     driver.quit().await
@@ -272,53 +321,24 @@ async fn signs_a_pdf_through_a_triphase_server() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
 
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/pades/doc.pdf", test_data()))
-        .await?;
+    open_file(&driver, "pades/doc.pdf").await?;
     wait(&driver, By::Id("pades_options")).await?;
-    driver
-        .find(By::Id("triphase_summary"))
-        .await?
-        .click()
-        .await?;
+    customize(&driver).await?;
     driver.find(By::Id("sign_triphase")).await?.click().await?;
-    driver
-        .find(By::Id("sign_server"))
+    wait(&driver, By::Id("sign_server"))
         .await?
         .send_keys(&server)
         .await?;
-
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("PDF firmado en PAdES"), "{result}");
 
     // A co-signature of a CAdES signature, on the same server (the options stay).
-    driver
-        .find(By::Id("sign_file"))
-        .await?
-        .send_keys(format!(
-            "{}/cades/autofirma-implicit-age-rsa.csig",
-            test_data()
-        ))
-        .await?;
-    wait(&driver, By::Id("sign_operation")).await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    open_file(&driver, "cades/autofirma-implicit-age-rsa.csig").await?;
+    wait(&driver, By::Id("summary_triphase")).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("Cofirma CAdES generada"), "{result}");
 
     driver.quit().await
-}
-
-/// Selects `value` in the `<select>` with `id`.
-async fn choose(driver: &WebDriver, id: &str, value: &str) -> WebDriverResult<()> {
-    wait(driver, By::Id(id))
-        .await?
-        .find(By::Css(format!("option[value='{value}']")))
-        .await?
-        .click()
-        .await
 }
 
 #[tokio::test]
@@ -326,44 +346,31 @@ async fn choose(driver: &WebDriver, id: &str, value: &str) -> WebDriverResult<()
 async fn signs_xml_in_xades_facturae_and_asic() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
 
     // XML: XAdES preselected; enveloped.
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/xades/doc.xml", test_data()))
-        .await?;
-    let format = wait(&driver, By::Css("#file_format td"))
-        .await?
-        .text()
-        .await?;
-    assert_eq!(format, "XAdES");
+    open_file(&driver, "xades/doc.xml").await?;
+    let format = wait_text(&driver, "summary_format", "XAdES").await?;
+    assert_eq!(format, "XAdES envolvente");
+    customize(&driver).await?;
     choose(&driver, "sign_xades_format", "enveloped").await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let format = wait_text(&driver, "summary_format", "dentro del XML").await?;
+    assert_eq!(format, "XAdES dentro del XML");
+    let result = sign(&driver).await?;
     assert!(result.contains("Firma XAdES generada"), "{result}");
     assert!(result.contains("doc.xml.xsig"), "{result}");
 
     // FacturaE invoice: detected and signed as such.
-    driver
-        .find(By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/xades/factura.xml", test_data()))
-        .await?;
-    wait(&driver, By::Id("sign_role")).await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    open_file(&driver, "xades/factura.xml").await?;
+    let format = wait_text(&driver, "summary_format", "FacturaE").await?;
+    assert_eq!(format, "FacturaE, como emisor");
+    let result = sign(&driver).await?;
     assert!(result.contains("Factura electrónica firmada"), "{result}");
 
     // Binary data in a CAdES ASiC-S container.
-    driver
-        .find(By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/xades/doc.txt", test_data()))
-        .await?;
+    open_file(&driver, "xades/doc.txt").await?;
+    customize(&driver).await?;
     wait(&driver, By::Id("sign_asic")).await?.click().await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(
         result.contains("Contenedor ASiC-S con firma CAdES"),
         "{result}"
@@ -377,7 +384,6 @@ async fn signs_xml_in_xades_facturae_and_asic() -> WebDriverResult<()> {
 #[ignore]
 async fn verifies_xml_and_asic_signatures() -> WebDriverResult<()> {
     let driver = driver().await?;
-    driver.goto(format!("{APP_URL}#/verify")).await?;
     for (file, expected) in [
         (
             "xades/autofirma-enveloped-age-rsa.xsig",
@@ -389,19 +395,8 @@ async fn verifies_xml_and_asic_signatures() -> WebDriverResult<()> {
         ),
         ("asic/autofirma-xades-rsa.asics", "Contenedor ASiC-S"),
     ] {
-        wait(&driver, By::Id("verify_file"))
-            .await?
-            .send_keys(format!("{}/{file}", test_data()))
-            .await?;
-        // Wait for this file's result, not the previous one.
-        let summary = driver
-            .query(By::Id("verify_summary"))
-            .with_text(expected.to_string())
-            .wait(Duration::from_secs(10), Duration::from_millis(200));
-        let summary = match summary.first().await {
-            Ok(summary) => summary.text().await?,
-            Err(_) => driver.find(By::Id("verify_summary")).await?.text().await?,
-        };
+        open_one(&driver, file).await?;
+        let summary = wait_text(&driver, "verify_summary", expected).await?;
         assert!(
             summary.contains("Firmas válidas") && summary.contains(expected),
             "{file}: {summary}"
@@ -421,39 +416,29 @@ async fn signs_with_timestamps() -> WebDriverResult<()> {
     };
     let driver = driver().await?;
     import_certificate(&driver).await?;
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
 
     // PDF: signature and document timestamps.
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/pades/doc.pdf", test_data()))
-        .await?;
+    open_file(&driver, "pades/doc.pdf").await?;
     wait(&driver, By::Id("pades_options")).await?;
-    driver
-        .find(By::Id("timestamp_summary"))
-        .await?
-        .click()
-        .await?;
+    customize(&driver).await?;
     driver.find(By::Id("sign_timestamp")).await?.click().await?;
-    driver
-        .find(By::Id("sign_tsa"))
+    wait(&driver, By::Id("sign_tsa"))
         .await?
         .send_keys(&tsa)
         .await?;
     choose(&driver, "sign_pdf_timestamp", "both").await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("con sello de tiempo"), "{result}");
 
     // XAdES-T: the timestamp options stay set for the next file.
-    driver
-        .find(By::Id("sign_file"))
+    open_file(&driver, "xades/doc.xml").await?;
+    let stamp = driver
+        .find(By::Id("summary_timestamp"))
         .await?
-        .send_keys(format!("{}/xades/doc.xml", test_data()))
+        .text()
         .await?;
-    wait(&driver, By::Id("sign_xades_format")).await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    assert_eq!(stamp, "Con sello de tiempo");
+    let result = sign(&driver).await?;
     assert!(
         result.contains("Firma XAdES generada con sello de tiempo"),
         "{result}"
@@ -467,21 +452,15 @@ async fn signs_with_timestamps() -> WebDriverResult<()> {
 async fn cosigns_and_countersigns_signatures() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
 
     // A CAdES signature: co-signed by default.
-    wait(&driver, By::Id("sign_file"))
-        .await?
-        .send_keys(format!(
-            "{}/cades/autofirma-implicit-age-rsa.csig",
-            test_data()
-        ))
-        .await?;
+    open_file(&driver, "cades/autofirma-implicit-age-rsa.csig").await?;
     let note = wait(&driver, By::Id("sign_note")).await?.text().await?;
-    assert!(note.contains("cofirmarla"), "{note}");
+    assert!(note.contains("cofirma"), "{note}");
+    let format = driver.find(By::Id("summary_format")).await?.text().await?;
+    assert_eq!(format, "Cofirma CAdES");
     assert!(driver.find(By::Id("sign_format")).await.is_err());
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("Cofirma CAdES generada"), "{result}");
     assert!(
         result.contains("autofirma-implicit-age-rsa_cosigned.csig"),
@@ -489,30 +468,19 @@ async fn cosigns_and_countersigns_signatures() -> WebDriverResult<()> {
     );
 
     // Counter-sign every signature of a XAdES signature.
-    driver
-        .find(By::Id("sign_file"))
-        .await?
-        .send_keys(format!(
-            "{}/xades/autofirma-enveloped-rsa.xsig",
-            test_data()
-        ))
-        .await?;
+    open_file(&driver, "xades/autofirma-enveloped-rsa.xsig").await?;
+    customize(&driver).await?;
     choose(&driver, "sign_operation", "tree").await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("Contrafirma XAdES generada"), "{result}");
     assert!(result.contains("_countersigned.xsig"), "{result}");
 
     // Or sign the signature as plain data.
-    driver
-        .find(By::Id("sign_file"))
-        .await?
-        .send_keys(format!("{}/cades/autofirma-explicit-rsa.csig", test_data()))
-        .await?;
+    open_file(&driver, "cades/autofirma-explicit-rsa.csig").await?;
+    customize(&driver).await?;
     choose(&driver, "sign_operation", "sign").await?;
     wait(&driver, By::Id("sign_format")).await?;
-    driver.find(By::Id("sign_button")).await?.click().await?;
-    let result = signature_result(&driver).await?;
+    let result = sign(&driver).await?;
     assert!(result.contains("Firma CAdES generada"), "{result}");
 
     driver.quit().await
@@ -523,7 +491,6 @@ async fn cosigns_and_countersigns_signatures() -> WebDriverResult<()> {
 async fn signs_office_documents() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
-    driver.find(By::LinkText("Firmar")).await?.click().await?;
 
     for (file, format, signed) in [
         ("odf/doc.odt", "ODF", "doc_signed.odt"),
@@ -531,19 +498,10 @@ async fn signs_office_documents() -> WebDriverResult<()> {
         // Signed by AutoFirma: one more signature.
         ("odf/autofirma-rsa.odt", "ODF", "autofirma-rsa_signed.odt"),
     ] {
-        wait(&driver, By::Id("sign_file"))
-            .await?
-            .send_keys(format!("{}/{file}", test_data()))
-            .await?;
-        let shown = driver
-            .query(By::Css("#file_format td"))
-            .with_text(format.to_string())
-            .wait(Duration::from_secs(10), Duration::from_millis(200))
-            .first()
-            .await?;
-        assert_eq!(shown.text().await?, format);
-        driver.find(By::Id("sign_button")).await?.click().await?;
-        let result = signature_result(&driver).await?;
+        open_file(&driver, file).await?;
+        let shown = wait_text(&driver, "summary_format", format).await?;
+        assert_eq!(shown, format!("{format}, dentro del documento"));
+        let result = sign(&driver).await?;
         assert!(
             result.contains(&format!("Documento firmado en {format}")),
             "{file}: {result}"
@@ -559,25 +517,17 @@ async fn signs_office_documents() -> WebDriverResult<()> {
 async fn signs_many_files_into_a_zip() -> WebDriverResult<()> {
     let driver = driver().await?;
     import_certificate(&driver).await?;
-    driver
-        .find(By::LinkText("Firma por lotes"))
-        .await?
-        .click()
-        .await?;
 
-    let files: Vec<String> = [
-        "pades/doc.pdf",
-        "xades/doc.xml",
-        "cades/doc.txt",
-        "odf/doc.odt",
-    ]
-    .iter()
-    .map(|file| format!("{}/{file}", test_data()))
-    .collect();
-    wait(&driver, By::Id("batch_files"))
-        .await?
-        .send_keys(files.join("\n"))
-        .await?;
+    open_files(
+        &driver,
+        &[
+            "pades/doc.pdf",
+            "xades/doc.xml",
+            "cades/doc.txt",
+            "odf/doc.odt",
+        ],
+    )
+    .await?;
     let button = driver
         .query(By::Id("batch_sign_button"))
         .with_text("Firmar 4 ficheros")
@@ -605,7 +555,6 @@ async fn signs_many_files_into_a_zip() -> WebDriverResult<()> {
 #[ignore]
 async fn verifies_office_documents_and_countersignatures() -> WebDriverResult<()> {
     let driver = driver().await?;
-    driver.goto(format!("{APP_URL}#/verify")).await?;
     for (file, expected) in [
         (
             "cades/autofirma-countersign-ec.csig",
@@ -624,18 +573,8 @@ async fn verifies_office_documents_and_countersignatures() -> WebDriverResult<()
             "Documento Office (OOXML) con 1 firma",
         ),
     ] {
-        wait(&driver, By::Id("verify_file"))
-            .await?
-            .send_keys(format!("{}/{file}", test_data()))
-            .await?;
-        let summary = driver
-            .query(By::Id("verify_summary"))
-            .with_text(expected.to_string())
-            .wait(Duration::from_secs(10), Duration::from_millis(200));
-        let summary = match summary.first().await {
-            Ok(summary) => summary.text().await?,
-            Err(_) => driver.find(By::Id("verify_summary")).await?.text().await?,
-        };
+        open_one(&driver, file).await?;
+        let summary = wait_text(&driver, "verify_summary", expected).await?;
         assert!(
             summary.contains("Firmas válidas") && summary.contains(expected),
             "{file}: {summary}"
@@ -649,6 +588,33 @@ async fn verifies_office_documents_and_countersignatures() -> WebDriverResult<()
         depths.is_empty(),
         "the last document has no counter-signatures"
     );
+
+    driver.quit().await
+}
+
+#[tokio::test]
+#[ignore]
+async fn remembers_changed_options() -> WebDriverResult<()> {
+    let driver = driver().await?;
+
+    open_file(&driver, "cades/doc.txt").await?;
+    customize(&driver).await?;
+    choose(&driver, "sign_digest", "sha256").await?;
+    let digest = wait(&driver, By::Id("summary_digest")).await?;
+    assert_eq!(digest.text().await?, "SHA-256");
+    assert_eq!(digest.attr("title").await?.as_deref(), Some("Cambiado"));
+
+    // Still there after a reload.
+    driver.refresh().await?;
+    open_file(&driver, "cades/doc.txt").await?;
+    let digest = wait_text(&driver, "summary_digest", "SHA-256").await?;
+    assert_eq!(digest, "SHA-256");
+
+    // Until reset.
+    customize(&driver).await?;
+    driver.find(By::Id("sign_reset")).await?.click().await?;
+    let digest = wait_text(&driver, "summary_digest", "SHA-512").await?;
+    assert_eq!(digest, "SHA-512");
 
     driver.quit().await
 }

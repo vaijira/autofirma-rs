@@ -14,10 +14,10 @@ use crate::app::App;
 mod app;
 mod components;
 mod css;
-mod pages;
-mod router;
+mod prefs;
 mod state;
 mod utils;
+mod views;
 mod worker;
 
 const APP_ID: &str = "autofirmaApp";
