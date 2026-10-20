@@ -10,6 +10,11 @@
 //! Signing is done in two phases ([`prepare`] and [`PreparedSignature::finish`]) so
 //! that the private key operation can happen elsewhere (triphase signing, smart
 //! cards, asynchronous keys).
+//!
+//! Co-signatures ([`cosign`]) add a signer over the same content; counter-signatures
+//! ([`countersign`]) sign the signature value of existing signers and go in their
+//! `countersignature` unsigned attribute, as AutoFirma's `AOCAdESCoSigner` and
+//! `AOCAdESCounterSigner` do.
 
 use std::time::Duration;
 
@@ -44,6 +49,7 @@ use crate::{
     digest::DigestAlgorithm,
     error::{Error, Result},
     keystore::SigningKey,
+    multisign::CounterSignTarget,
     policy::SignaturePolicy,
     tsp::{self, TimestampReport},
 };
@@ -91,21 +97,26 @@ impl PreparedSignature {
         &self.to_be_signed
     }
 
-    /// Builds the CAdES signature (DER `ContentInfo`) from the raw signature value.
-    pub fn finish(self, signature: &[u8]) -> Result<Vec<u8>> {
+    /// `SignerInfo` with the raw signature value.
+    fn signer_info(&self, signature: &[u8]) -> Result<SignerInfo> {
         let leaf = &self.chain[0];
-        let signer_info = SignerInfo {
+        Ok(SignerInfo {
             version: CmsVersion::V1,
             sid: SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
                 issuer: leaf.tbs_certificate().issuer().clone(),
                 serial_number: leaf.tbs_certificate().serial_number().clone(),
             }),
             digest_alg: self.digest.algorithm_identifier(),
-            signed_attrs: Some(self.signed_attributes),
+            signed_attrs: Some(self.signed_attributes.clone()),
             signature_algorithm: cms_signature_algorithm(self.key_type, self.digest),
             signature: OctetString::new(signature)?,
             unsigned_attrs: None,
-        };
+        })
+    }
+
+    /// Builds the CAdES signature (DER `ContentInfo`) from the raw signature value.
+    pub fn finish(self, signature: &[u8]) -> Result<Vec<u8>> {
+        let signer_info = self.signer_info(signature)?;
 
         let certificates = self
             .chain
@@ -129,11 +140,7 @@ impl PreparedSignature {
             signer_infos: SignerInfos(SetOfVec::try_from(vec![signer_info])?),
         };
 
-        let content_info = ContentInfo {
-            content_type: oid::SIGNED_DATA,
-            content: Any::encode_from(&signed_data)?,
-        };
-        Ok(content_info.to_der()?)
+        encode_signed_data(&signed_data)
     }
 
     /// Upper bound of the DER size of the finished signature, used to reserve
@@ -168,6 +175,9 @@ pub(crate) struct AttributeOptions<'a> {
     pub policy: Option<&'a SignaturePolicy>,
     /// `contentType`, `id-data` when `None`.
     pub content_type: Option<ObjectIdentifier>,
+    /// Counter-signature: no `contentType` (RFC 5652, 11.1) and a `contentHint`
+    /// of `id-data` without description, as AutoFirma writes them.
+    pub counter_signature: bool,
 }
 
 /// First phase of a signature: builds the signed attributes for `data`.
@@ -193,6 +203,7 @@ pub fn prepare(
             content_description: params.content_description.as_deref(),
             policy: params.policy.as_ref(),
             content_type: None,
+            counter_signature: false,
         },
     )
 }
@@ -213,18 +224,23 @@ pub(crate) fn prepare_digest(
 
     let content_type = options.content_type.unwrap_or(oid::DATA);
     let mut attributes = vec![
-        attribute(oid::CONTENT_TYPE, &content_type)?,
         attribute(oid::MESSAGE_DIGEST, &OctetString::new(message_digest)?)?,
         signing_certificate_v2(leaf, digest)?,
     ];
+    if !options.counter_signature {
+        attributes.push(attribute(oid::CONTENT_TYPE, &content_type)?);
+    }
     if let Some(signing_time) = options.signing_time {
         attributes.push(signing_time_attribute(signing_time)?);
     }
-    if let Some(description) = options.content_description {
+    let content_description = options
+        .content_description
+        .filter(|_| !options.counter_signature);
+    if content_description.is_some() || options.counter_signature {
         attributes.push(attribute(
             oid::CONTENT_HINT,
             &ContentHints {
-                content_description: Some(description.to_string()),
+                content_description: content_description.map(str::to_string),
                 content_type: oid::DATA,
             },
         )?);
@@ -255,6 +271,227 @@ pub fn sign(data: &[u8], key: &dyn SigningKey, params: &CadesParams) -> Result<V
     prepared.finish(&signature)
 }
 
+/// Unsigned attributes of long-term (archive) signatures, which a new signer would
+/// invalidate (AutoFirma's `CAdESMultiUtil.UNSUPPORTED_ATTRIBUTES`).
+const LONG_TERM_ATTRIBUTES: [ObjectIdentifier; 4] = [
+    oid::ARCHIVE_TIMESTAMP,
+    oid::ARCHIVE_TIMESTAMP_V2,
+    oid::ARCHIVE_TIMESTAMP_V3,
+    oid::LONG_TERM_VALIDATION,
+];
+
+/// Fails if some signer, counter-signers included, has long-term attributes.
+fn check_long_term(signers: &[SignerInfo]) -> Result<()> {
+    for signer in signers {
+        for attr in signer.unsigned_attrs.iter().flat_map(|attrs| attrs.iter()) {
+            if LONG_TERM_ATTRIBUTES.contains(&attr.oid) {
+                return Err(Error::LongTermSignature);
+            }
+        }
+        check_long_term(&counter_signers(signer))?;
+    }
+    Ok(())
+}
+
+/// Counter-signers of `signer` (its `countersignature` attributes).
+fn counter_signers(signer: &SignerInfo) -> Vec<SignerInfo> {
+    signer
+        .unsigned_attrs
+        .iter()
+        .flat_map(|attrs| attrs.iter())
+        .filter(|attr| attr.oid == oid::COUNTER_SIGNATURE)
+        .flat_map(|attr| attr.values.iter())
+        .filter_map(|value| value.decode_as::<SignerInfo>().ok())
+        .collect()
+}
+
+/// Adds the certificates of `chain` that the signature does not have yet.
+fn add_certificates(signed_data: &mut SignedData, chain: &[Certificate]) -> Result<()> {
+    let mut certificates: Vec<CertificateChoices> = signed_data
+        .certificates
+        .iter()
+        .flat_map(|set| set.0.iter().cloned())
+        .collect();
+    for cert in chain {
+        let choice = CertificateChoices::Certificate(cert.clone());
+        if !certificates.contains(&choice) {
+            certificates.push(choice);
+        }
+    }
+    signed_data.certificates = Some(CertificateSet(SetOfVec::try_from(certificates)?));
+    Ok(())
+}
+
+fn encode_signed_data(signed_data: &SignedData) -> Result<Vec<u8>> {
+    let content_info = ContentInfo {
+        content_type: oid::SIGNED_DATA,
+        content: Any::encode_from(signed_data)?,
+    };
+    Ok(content_info.to_der()?)
+}
+
+/// `messageDigest` of the first signer that used `digest`.
+fn existing_message_digest(signers: &[SignerInfo], digest: DigestAlgorithm) -> Option<Vec<u8>> {
+    signers
+        .iter()
+        .filter(|signer| DigestAlgorithm::from_oid(&signer.digest_alg.oid) == Some(digest))
+        .flat_map(|signer| signer.signed_attrs.iter().flat_map(|attrs| attrs.iter()))
+        .find(|attr| attr.oid == oid::MESSAGE_DIGEST)
+        .and_then(|attr| attr.values.get(0))
+        .and_then(|value| value.decode_as::<OctetString>().ok())
+        .map(|octets| octets.as_bytes().to_vec())
+}
+
+/// Adds a signer to a CAdES signature (co-signature).
+///
+/// The new signer signs the same content as the existing ones: `data` when
+/// given, else the content embedded in the signature, else the `messageDigest`
+/// of an existing signer that used `params.digest` (explicit signatures signed
+/// with another algorithm need `data`). With `data` and `params.mode` implicit,
+/// the content is embedded if the signature did not have it.
+pub fn cosign(
+    signature: &[u8],
+    data: Option<&[u8]>,
+    key: &dyn SigningKey,
+    params: &CadesParams,
+) -> Result<Vec<u8>> {
+    let mut signed_data = parse_signed_data(signature)?;
+    let mut signers: Vec<SignerInfo> = signed_data.signer_infos.0.iter().cloned().collect();
+    check_long_term(&signers)?;
+    let embedded = embedded(&signed_data)?;
+    let digest = params.digest;
+    let message_digest = match data.or(embedded.as_deref()) {
+        Some(content) => digest.digest(content),
+        None => existing_message_digest(&signers, digest).ok_or(Error::MissingSignedData)?,
+    };
+    if let Some(data) = data
+        && embedded.is_none()
+        && params.mode == SignatureMode::Implicit
+    {
+        signed_data.encap_content_info.econtent = Some(Any::new(Tag::OctetString, data)?);
+    }
+
+    let chain = key.certificate_chain();
+    let prepared = prepare_digest(
+        &message_digest,
+        None,
+        chain,
+        key.key_type(),
+        digest,
+        AttributeOptions {
+            signing_time: Some(params.signing_time),
+            content_description: params.content_description.as_deref(),
+            policy: params.policy.as_ref(),
+            content_type: Some(signed_data.encap_content_info.econtent_type),
+            counter_signature: false,
+        },
+    )?;
+    let value = key.sign_raw(digest, prepared.to_be_signed())?;
+    signers.push(prepared.signer_info(&value)?);
+
+    let mut digest_algorithms: Vec<AlgorithmIdentifierOwned> =
+        signed_data.digest_algorithms.iter().cloned().collect();
+    if !digest_algorithms.iter().any(|alg| alg.oid == digest.oid()) {
+        digest_algorithms.push(digest.algorithm_identifier());
+    }
+    signed_data.digest_algorithms = SetOfVec::try_from(digest_algorithms)?;
+    signed_data.signer_infos = SignerInfos(SetOfVec::try_from(signers)?);
+    add_certificates(&mut signed_data, chain)?;
+    encode_signed_data(&signed_data)
+}
+
+/// Counter-signs the signers of a CAdES signature chosen by `target`: every
+/// signer and counter-signer ([`CounterSignTarget::Tree`]), or those without
+/// counter-signatures ([`CounterSignTarget::Leafs`]).
+pub fn countersign(
+    signature: &[u8],
+    target: CounterSignTarget,
+    key: &dyn SigningKey,
+    params: &CadesParams,
+) -> Result<Vec<u8>> {
+    let mut signed_data = parse_signed_data(signature)?;
+    let signers: Vec<SignerInfo> = signed_data.signer_infos.0.iter().cloned().collect();
+    check_long_term(&signers)?;
+    let signers = signers
+        .into_iter()
+        .map(|signer| countersign_signer(signer, target, key, params))
+        .collect::<Result<Vec<_>>>()?;
+    signed_data.signer_infos = SignerInfos(SetOfVec::try_from(signers)?);
+    add_certificates(&mut signed_data, key.certificate_chain())?;
+    encode_signed_data(&signed_data)
+}
+
+/// Counter-signs `signer` and, recursively, its counter-signers.
+fn countersign_signer(
+    mut signer: SignerInfo,
+    target: CounterSignTarget,
+    key: &dyn SigningKey,
+    params: &CadesParams,
+) -> Result<SignerInfo> {
+    let mut attributes: Vec<Attribute> = signer
+        .unsigned_attrs
+        .iter()
+        .flat_map(|attrs| attrs.iter().cloned())
+        .collect();
+    let mut leaf = true;
+    for attr in attributes
+        .iter_mut()
+        .filter(|attr| attr.oid == oid::COUNTER_SIGNATURE)
+    {
+        leaf = false;
+        let values = attr
+            .values
+            .iter()
+            .map(|value| match value.decode_as::<SignerInfo>() {
+                Ok(inner) => Ok(Any::encode_from(&countersign_signer(
+                    inner, target, key, params,
+                )?)?),
+                // Keep values that are not SignerInfos as they are.
+                Err(_) => Ok(value.clone()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        attr.values = SetOfVec::try_from(values)?;
+    }
+
+    if target == CounterSignTarget::Tree || leaf {
+        let digest = params.digest;
+        let prepared = prepare_digest(
+            &digest.digest(signer.signature.as_bytes()),
+            None,
+            key.certificate_chain(),
+            key.key_type(),
+            digest,
+            AttributeOptions {
+                signing_time: Some(params.signing_time),
+                content_description: None,
+                policy: params.policy.as_ref(),
+                content_type: None,
+                counter_signature: true,
+            },
+        )?;
+        let value = key.sign_raw(digest, prepared.to_be_signed())?;
+        let counter_signer = Any::encode_from(&prepared.signer_info(&value)?)?;
+        match attributes
+            .iter_mut()
+            .find(|attr| attr.oid == oid::COUNTER_SIGNATURE)
+        {
+            Some(attr) => {
+                let mut values: Vec<Any> = attr.values.iter().cloned().collect();
+                values.push(counter_signer);
+                attr.values = SetOfVec::try_from(values)?;
+            }
+            None => attributes.push(Attribute {
+                oid: oid::COUNTER_SIGNATURE,
+                values: SetOfVec::try_from(vec![counter_signer])?,
+            }),
+        }
+    }
+    signer.unsigned_attrs = (!attributes.is_empty())
+        .then(|| SetOfVec::try_from(attributes))
+        .transpose()?;
+    Ok(signer)
+}
+
 /// Result of verifying one signer of a CAdES signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignerReport {
@@ -271,6 +508,10 @@ pub struct SignerReport {
     /// Signature timestamps (CAdES-T, XAdES-T), oldest first.
     #[serde(default)]
     pub timestamps: Vec<TimestampReport>,
+    /// `0` for signers, `1` for counter-signatures of a signer, `2` for
+    /// counter-signatures of a counter-signature...
+    #[serde(default)]
+    pub depth: u32,
 }
 
 /// Outcome of the cryptographic verification of a signer.
@@ -296,7 +537,7 @@ pub enum SignerStatus {
 pub struct VerifyReport {
     /// The signed data is included in the signature (implicit).
     pub implicit: bool,
-    /// One report per signer.
+    /// One report per signer, each followed by its counter-signatures (depth first).
     pub signers: Vec<SignerReport>,
 }
 
@@ -329,12 +570,10 @@ pub fn verify(signature: &[u8], data: Option<&[u8]>) -> Result<VerifyReport> {
         })
         .collect();
 
-    let signers = signed_data
-        .signer_infos
-        .0
-        .iter()
-        .map(|signer| verify_signer(signer, &certificates, content))
-        .collect::<Result<Vec<_>>>()?;
+    let mut signers = Vec::new();
+    for signer in signed_data.signer_infos.0.iter() {
+        verify_tree(signer, &certificates, content, 0, &mut signers)?;
+    }
 
     Ok(VerifyReport {
         implicit: embedded.is_some(),
@@ -439,11 +678,7 @@ pub fn add_timestamps(
         ));
     }
     signed_data.signer_infos = SignerInfos(SetOfVec::try_from(signers)?);
-    let content_info = ContentInfo {
-        content_type: oid::SIGNED_DATA,
-        content: Any::encode_from(&signed_data)?,
-    };
-    Ok(content_info.to_der()?)
+    encode_signed_data(&signed_data)
 }
 
 fn embedded(signed_data: &SignedData) -> Result<Option<Vec<u8>>> {
@@ -457,6 +692,29 @@ fn embedded(signed_data: &SignedData) -> Result<Option<Vec<u8>>> {
                 .map_err(|e| Error::InvalidSignature(e.to_string()))
         })
         .transpose()
+}
+
+/// Verifies `signer` over `content` and its counter-signers over its signature value.
+fn verify_tree(
+    signer: &SignerInfo,
+    certificates: &[&Certificate],
+    content: &[u8],
+    depth: u32,
+    reports: &mut Vec<SignerReport>,
+) -> Result<()> {
+    let mut report = verify_signer(signer, certificates, content)?;
+    report.depth = depth;
+    reports.push(report);
+    for counter_signer in counter_signers(signer) {
+        verify_tree(
+            &counter_signer,
+            certificates,
+            signer.signature.as_bytes(),
+            depth + 1,
+            reports,
+        )?;
+    }
+    Ok(())
 }
 
 fn verify_signer(
@@ -482,6 +740,7 @@ fn verify_signer(
         policy: None,
         status: SignerStatus::Valid,
         timestamps: signature_timestamps(signer),
+        depth: 0,
     };
 
     let Some(digest) = digest else {
@@ -886,5 +1145,261 @@ mod tests {
             report.signers[0].policy.as_deref(),
             Some("2.16.724.1.3.1.1.2.1.9")
         );
+    }
+
+    #[test]
+    fn cosign_explicit_and_implicit() {
+        let rsa = &load("rsa.p12")[0];
+        let ec = &load("ec.p12")[0];
+        // Explicit, same algorithm: the messageDigest of the first signer is reused.
+        let explicit = sign(
+            DATA,
+            rsa,
+            &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let cosigned = cosign(
+            &explicit,
+            None,
+            ec,
+            &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, true),
+        )
+        .unwrap();
+        let report = verify(&cosigned, Some(DATA)).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!(report.signers.len(), 2);
+        assert!(!report.implicit);
+        // Another algorithm needs the data.
+        assert!(matches!(
+            cosign(
+                &explicit,
+                None,
+                ec,
+                &params(DigestAlgorithm::Sha256, SignatureMode::Explicit, false)
+            ),
+            Err(Error::MissingSignedData)
+        ));
+        let cosigned = cosign(
+            &explicit,
+            Some(DATA),
+            ec,
+            &params(DigestAlgorithm::Sha256, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let report = verify(&cosigned, Some(DATA)).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        // DER sorts the SignerInfos: the new one is not necessarily the last.
+        assert!(
+            report
+                .signers
+                .iter()
+                .any(|s| s.digest == Some(DigestAlgorithm::Sha256))
+        );
+        let digests = parse_signed_data(&cosigned).unwrap().digest_algorithms;
+        assert_eq!(digests.len(), 2);
+        // With the data and implicit mode, the data is embedded.
+        let cosigned = cosign(
+            &explicit,
+            Some(DATA),
+            ec,
+            &params(DigestAlgorithm::Sha256, SignatureMode::Implicit, false),
+        )
+        .unwrap();
+        let report = verify(&cosigned, None).unwrap();
+        assert!(report.is_valid() && report.implicit, "{report:?}");
+
+        // Implicit: the embedded content is signed again.
+        let implicit = sign(
+            DATA,
+            rsa,
+            &params(DigestAlgorithm::Sha256, SignatureMode::Implicit, false),
+        )
+        .unwrap();
+        let cosigned = cosign(
+            &implicit,
+            None,
+            ec,
+            &params(DigestAlgorithm::Sha384, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let report = verify(&cosigned, None).unwrap();
+        assert!(report.is_valid() && report.implicit, "{report:?}");
+        assert_eq!(report.signers.len(), 2);
+        // The certificates of both signers, once each.
+        let certificates = parse_signed_data(&cosigned).unwrap().certificates.unwrap();
+        assert_eq!(certificates.0.len(), 3);
+    }
+
+    #[test]
+    fn countersign_leafs_and_tree() {
+        let rsa = &load("rsa.p12")[0];
+        let ec = &load("ec.p12")[0];
+        let explicit = sign(
+            DATA,
+            rsa,
+            &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let cosigned = cosign(
+            &explicit,
+            None,
+            rsa,
+            &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+
+        let leafs = countersign(
+            &cosigned,
+            CounterSignTarget::Leafs,
+            ec,
+            &params(DigestAlgorithm::Sha256, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let report = verify(&leafs, Some(DATA)).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        let depths: Vec<u32> = report.signers.iter().map(|s| s.depth).collect();
+        assert_eq!(depths, [0, 1, 0, 1]);
+
+        let tree = countersign(
+            &leafs,
+            CounterSignTarget::Tree,
+            rsa,
+            &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, true),
+        )
+        .unwrap();
+        let report = verify(&tree, Some(DATA)).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!(report.signers.len(), 8);
+        assert_eq!(report.signers.iter().filter(|s| s.depth == 2).count(), 2);
+
+        let again = countersign(
+            &tree,
+            CounterSignTarget::Leafs,
+            ec,
+            &params(DigestAlgorithm::Sha384, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let report = verify(&again, Some(DATA)).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!(report.signers.len(), 12);
+
+        // Counter-signature attributes: no contentType, a contentHint without description.
+        let signed_data = parse_signed_data(&leafs).unwrap();
+        let signer = signed_data.signer_infos.0.get(0).unwrap();
+        let counter_signer = &counter_signers(signer)[0];
+        let oids: Vec<_> = counter_signer
+            .signed_attrs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|a| a.oid)
+            .collect();
+        assert!(!oids.contains(&oid::CONTENT_TYPE));
+        let hint = counter_signer
+            .signed_attrs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|a| a.oid == oid::CONTENT_HINT)
+            .unwrap();
+        assert_eq!(
+            hint.values.get(0).unwrap().to_der().unwrap(),
+            [
+                0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01
+            ]
+        );
+
+        // A tampered counter-signature is reported.
+        let mut tampered = leafs.clone();
+        let value = counter_signer.signature.as_bytes();
+        let at = tampered
+            .windows(value.len())
+            .position(|w| w == value)
+            .unwrap();
+        tampered[at + 10] ^= 1;
+        let report = verify(&tampered, Some(DATA)).unwrap();
+        assert_eq!(report.signers[1].status, SignerStatus::InvalidSignature);
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn cosign_autofirma_signatures() {
+        let key = &load("ec.p12")[0];
+        for (name, data) in [
+            ("autofirma-explicit-rsa.csig", Some(fixture("doc.txt"))),
+            ("autofirma-implicit-age-rsa.csig", None),
+        ] {
+            let original = fixture(name);
+            let cosigned = cosign(
+                &original,
+                None,
+                key,
+                &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, false),
+            )
+            .unwrap();
+            let report = verify(&cosigned, data.as_deref()).unwrap();
+            assert!(report.is_valid(), "{name}: {report:?}");
+            let countersigned = countersign(
+                &original,
+                CounterSignTarget::Tree,
+                key,
+                &params(DigestAlgorithm::Sha256, SignatureMode::Explicit, false),
+            )
+            .unwrap();
+            let report = verify(&countersigned, data.as_deref()).unwrap();
+            assert!(report.is_valid(), "{name}: {report:?}");
+            assert_eq!(report.signers.len(), 2);
+        }
+    }
+
+    #[test]
+    fn verifies_autofirma_multisignatures() {
+        // Co-signature of the AGE signature, then counter-signed (tree) with EC.
+        let report = verify(&fixture("autofirma-cosign-rsa.csig"), None).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!(report.signers.len(), 2);
+        let countersigned = fixture("autofirma-countersign-ec.csig");
+        let report = verify(&countersigned, None).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        let depths: Vec<u32> = report.signers.iter().map(|s| s.depth).collect();
+        assert_eq!(depths, [0, 1, 0, 1]);
+
+        // Our counter-signatures have the attributes of AutoFirma's.
+        let reference = parse_signed_data(&countersigned).unwrap();
+        let reference = &counter_signers(reference.signer_infos.0.get(0).unwrap())[0];
+        let key = &load("ec.p12")[0];
+        let ours = countersign(
+            &fixture("autofirma-cosign-rsa.csig"),
+            CounterSignTarget::Leafs,
+            key,
+            &params(DigestAlgorithm::Sha512, SignatureMode::Explicit, false),
+        )
+        .unwrap();
+        let ours = parse_signed_data(&ours).unwrap();
+        let ours = &counter_signers(ours.signer_infos.0.get(0).unwrap())[0];
+        let oids = |signer: &SignerInfo| {
+            let mut oids: Vec<String> = signer
+                .signed_attrs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|a| a.oid.to_string())
+                .collect();
+            oids.sort();
+            oids
+        };
+        assert_eq!(oids(ours), oids(reference));
+        let hint = |signer: &SignerInfo| {
+            signer
+                .signed_attrs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|a| a.oid == oid::CONTENT_HINT)
+                .unwrap()
+                .to_der()
+                .unwrap()
+        };
+        assert_eq!(hint(ours), hint(reference));
     }
 }

@@ -13,6 +13,7 @@ import com.sun.net.httpserver.HttpServer;
 import es.gob.afirma.core.misc.AOUtil;
 import es.gob.afirma.core.misc.Base64;
 import es.gob.afirma.core.signers.AOSignConstants;
+import es.gob.afirma.core.signers.CounterSignTarget;
 import es.gob.afirma.core.signers.ExtraParamsProcessor;
 import es.gob.afirma.core.signers.TriphaseData;
 import es.gob.afirma.triphase.signer.processors.CAdESTriPhasePreProcessor;
@@ -74,8 +75,8 @@ public class TriphaseServer {
         String op = params.get("op");
         String cop = params.get("cop");
         String format = params.get("format");
-        if (!"sign".equals(cop)) {
-            return "ERR-04:Solo se admite cop=sign";
+        if (!"sign".equals(cop) && !"cosign".equals(cop) && !"countersign".equals(cop)) {
+            return "ERR-04:Operacion criptografica no soportada: " + cop;
         }
 
         Properties extraParams = params.containsKey("params")
@@ -107,13 +108,25 @@ public class TriphaseServer {
         String algorithm = AOSignConstants.composeSignatureAlgorithmName(
             params.get("algo"), chain[0].getPublicKey().getAlgorithm());
 
+        // As SignatureService: the counter-signature target goes in the extra params.
+        CounterSignTarget target = "tree".equalsIgnoreCase(extraParams.getProperty("target", "").trim())
+            ? CounterSignTarget.TREE
+            : CounterSignTarget.LEAFS;
         if ("pre".equals(op)) {
-            TriphaseData pre = processor.preProcessPreSign(document, algorithm, chain, extraParams, false);
+            TriphaseData pre = switch (cop) {
+                case "cosign" -> processor.preProcessPreCoSign(document, algorithm, chain, extraParams, false);
+                case "countersign" -> processor.preProcessPreCounterSign(document, algorithm, chain, extraParams, target, false);
+                default -> processor.preProcessPreSign(document, algorithm, chain, extraParams, false);
+            };
             return Base64.encode(pre.toString().getBytes(StandardCharsets.UTF_8), true);
         }
         if ("post".equals(op)) {
             TriphaseData session = TriphaseData.parser(Base64.decode(params.get("session").trim(), true));
-            byte[] signed = processor.preProcessPostSign(document, algorithm, chain, extraParams, session);
+            byte[] signed = switch (cop) {
+                case "cosign" -> processor.preProcessPostCoSign(document, algorithm, chain, extraParams, session);
+                case "countersign" -> processor.preProcessPostCounterSign(document, algorithm, chain, extraParams, session, target);
+                default -> processor.preProcessPostSign(document, algorithm, chain, extraParams, session);
+            };
             return "OK NEWID=" + Base64.encode(signed, true);
         }
         return "ERR-01:Operacion no soportada: " + op;

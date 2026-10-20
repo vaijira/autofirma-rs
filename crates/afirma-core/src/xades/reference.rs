@@ -2,9 +2,10 @@
 //! the digest. Shared by signing (to compute `DigestValue`) and verification.
 //!
 //! The transforms are ours, on top of `bergshamra-c14n`: enveloped signature,
-//! Base64, the canonicalizations, and the XPath filters equivalent to the
+//! Base64, the canonicalizations, the XPath filters equivalent to the
 //! enveloped transform (`not(ancestor-or-self::ds:Signature)`, AutoFirma's),
-//! which are the only XPath expressions accepted.
+//! which are the only XPath expressions accepted, and the OPC relationship
+//! transform of OOXML packages (ISO/IEC 29500-2, 13.2.4.24).
 
 use std::collections::HashMap;
 
@@ -31,19 +32,66 @@ pub(crate) enum Transform {
     C14n(C14nMode, Vec<String>),
     /// Base64 decoding.
     Base64,
+    /// OPC relationship transform: the relationships with these `Id`s or `Type`s.
+    Relationships {
+        /// `SourceId` of the `RelationshipReference`s.
+        ids: Vec<String>,
+        /// `SourceType` of the `RelationshipsGroupReference`s.
+        types: Vec<String>,
+    },
 }
 
+/// OPC relationship transform.
+pub(crate) const RELATIONSHIP_TRANSFORM: &str =
+    "http://schemas.openxmlformats.org/package/2006/RelationshipTransform";
+/// OPC digital signature namespace (`mdssi`).
+pub(crate) const MDSSI_NS: &str =
+    "http://schemas.openxmlformats.org/package/2006/digital-signature";
+/// Exclusive C14N namespace (`InclusiveNamespaces`).
+const EXC_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
 impl Transform {
-    /// `ds:Transform` element.
-    pub fn to_xml(&self) -> String {
+    /// `Transform` element; `p` is the prefix of the XMLDSig namespace (`ds:`,
+    /// or empty for the default namespace).
+    pub fn to_xml(&self, p: &str) -> String {
         match self {
-            Transform::Enveloped => format!(r#"<ds:Transform Algorithm="{}"/>"#, uri::ENVELOPED),
+            Transform::Enveloped => format!(r#"<{p}Transform Algorithm="{}"/>"#, uri::ENVELOPED),
             Transform::NotSignatures => format!(
-                r#"<ds:Transform Algorithm="{}"><ds:XPath xmlns:ds="{DSIG_NS}">not(ancestor-or-self::ds:Signature)</ds:XPath></ds:Transform>"#,
+                r#"<{p}Transform Algorithm="{}"><{p}XPath xmlns:ds="{DSIG_NS}">not(ancestor-or-self::ds:Signature)</{p}XPath></{p}Transform>"#,
                 uri::XPATH
             ),
-            Transform::C14n(mode, _) => format!(r#"<ds:Transform Algorithm="{}"/>"#, mode.uri()),
-            Transform::Base64 => format!(r#"<ds:Transform Algorithm="{}"/>"#, uri::BASE64),
+            Transform::C14n(mode, prefixes) if prefixes.is_empty() => {
+                format!(r#"<{p}Transform Algorithm="{}"/>"#, mode.uri())
+            }
+            Transform::C14n(mode, prefixes) => {
+                let list: Vec<&str> = prefixes
+                    .iter()
+                    .map(|p| if p.is_empty() { "#default" } else { p })
+                    .collect();
+                format!(
+                    r#"<{p}Transform Algorithm="{}"><ec:InclusiveNamespaces xmlns:ec="{EXC_C14N_NS}" PrefixList="{}"/></{p}Transform>"#,
+                    mode.uri(),
+                    xml::escape_attr(&list.join(" "))
+                )
+            }
+            Transform::Base64 => format!(r#"<{p}Transform Algorithm="{}"/>"#, uri::BASE64),
+            Transform::Relationships { ids, types } => {
+                let mut out = format!(r#"<{p}Transform Algorithm="{RELATIONSHIP_TRANSFORM}">"#);
+                for id in ids {
+                    out.push_str(&format!(
+                        r#"<mdssi:RelationshipReference xmlns:mdssi="{MDSSI_NS}" SourceId="{}"/>"#,
+                        xml::escape_attr(id)
+                    ));
+                }
+                for source_type in types {
+                    out.push_str(&format!(
+                        r#"<mdssi:RelationshipsGroupReference xmlns:mdssi="{MDSSI_NS}" SourceType="{}"/>"#,
+                        xml::escape_attr(source_type)
+                    ));
+                }
+                out.push_str(&format!("</{p}Transform>"));
+                out
+            }
         }
     }
 
@@ -59,6 +107,19 @@ impl Transform {
                 let xpath = xml::child(doc, transform, DSIG_NS, "XPath")
                     .ok_or_else(|| invalid("transformada XPath sin expresión"))?;
                 parse_xpath(doc, xpath)
+            }
+            RELATIONSHIP_TRANSFORM => {
+                let values = |local: &str, attribute: &str| {
+                    xml::children(doc, transform, MDSSI_NS, local)
+                        .into_iter()
+                        .filter_map(|node| doc.get_attribute(node, attribute))
+                        .map(str::to_string)
+                        .collect()
+                };
+                Ok(Transform::Relationships {
+                    ids: values("RelationshipReference", "SourceId"),
+                    types: values("RelationshipsGroupReference", "SourceType"),
+                })
             }
             _ => {
                 let mode = C14nMode::from_uri(algorithm)
@@ -170,9 +231,9 @@ enum Data {
     Octets(Vec<u8>),
 }
 
-/// Data of a reference whose URI is not in the document (detached signatures):
-/// the external file the caller provides.
-pub(crate) type External<'a> = Option<&'a [u8]>;
+/// Resolves the references whose URI is not in the document (detached
+/// signatures, parts of ODF and OOXML packages) to the bytes they point to.
+pub(crate) type External<'a> = Option<&'a dyn Fn(&str) -> Result<Vec<u8>>>;
 
 /// Digest of a reference: dereferences `uri` in `doc`, applies `transforms`
 /// and hashes the result. `signature` is the `ds:Signature` element (for the
@@ -203,9 +264,8 @@ fn dereference(doc: &Document<'_>, ids: &Ids, uri: &str, external: External<'_>)
         return Ok(Data::Nodes(NodeSet::all_without_comments(doc)));
     }
     let Some(fragment) = uri.strip_prefix('#') else {
-        return external
-            .map(|data| Data::Octets(data.to_vec()))
-            .ok_or(Error::MissingSignedData);
+        let resolve = external.ok_or(Error::MissingSignedData)?;
+        return resolve(uri).map(Data::Octets);
     };
     if fragment == "xpointer(/)" {
         return Ok(Data::Nodes(NodeSet::all(doc)));
@@ -283,6 +343,81 @@ fn apply(doc: &Document<'_>, signature: NodeId, transform: &Transform, data: Dat
         (Transform::Enveloped, Data::Octets(_)) => {
             Err(invalid("la transformada enveloped necesita datos XML"))
         }
+        (Transform::Relationships { ids, types }, Data::Octets(octets)) => {
+            relationships(&octets, ids, types).map(Data::Octets)
+        }
+        (Transform::Relationships { .. }, Data::Nodes(_)) => Err(invalid(
+            "la transformada de relaciones necesita una parte del paquete",
+        )),
+    }
+}
+
+/// OPC relationship transform: keeps the `Relationship` elements selected by
+/// `Id` or `Type`, adds the default `TargetMode="Internal"`, sorts them by `Id`
+/// and drops everything else inside the root. The output is XML, to be
+/// canonicalized by the next transform.
+fn relationships(octets: &[u8], ids: &[String], types: &[String]) -> Result<Vec<u8>> {
+    let source = xml::XmlText::decode(octets)?;
+    let doc = bergshamra_xml::uppsala::parse(&source.text)
+        .map_err(|e| Error::InvalidXml(e.to_string()))?;
+    let root = doc
+        .document_element()
+        .ok_or_else(|| invalid("relaciones sin elemento raíz"))?;
+    let root_element = doc.element(root).expect("document element");
+    let mut kept: Vec<(String, String)> = xml::child_elements(&doc, root)
+        .into_iter()
+        .filter_map(|child| {
+            let element = doc.element(child)?;
+            let id = element.get_attribute("Id").unwrap_or_default();
+            let relationship_type = element.get_attribute("Type").unwrap_or_default();
+            let selected =
+                ids.iter().any(|i| i == id) || types.iter().any(|t| t == relationship_type);
+            if !selected || element.name.local_name != "Relationship" {
+                return None;
+            }
+            let mut out = format!("<{}", element.name.prefixed_name());
+            write_declarations_and_attributes(&mut out, element);
+            if element.get_attribute("TargetMode").is_none() {
+                out.push_str(r#" TargetMode="Internal""#);
+            }
+            out.push_str("/>");
+            Some((id.to_string(), out))
+        })
+        .collect();
+    kept.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let name = root_element.name.prefixed_name();
+    let mut out = format!("<{name}");
+    write_declarations_and_attributes(&mut out, root_element);
+    out.push('>');
+    for (_, relationship) in kept {
+        out.push_str(&relationship);
+    }
+    out.push_str(&format!("</{name}>"));
+    Ok(out.into_bytes())
+}
+
+/// Writes the namespace declarations and attributes of `element`, escaped.
+fn write_declarations_and_attributes(
+    out: &mut String,
+    element: &bergshamra_xml::uppsala::Element<'_>,
+) {
+    for (prefix, namespace) in &element.namespace_declarations {
+        if prefix.is_empty() {
+            out.push_str(&format!(r#" xmlns="{}""#, xml::escape_attr(namespace)));
+        } else {
+            out.push_str(&format!(
+                r#" xmlns:{prefix}="{}""#,
+                xml::escape_attr(namespace)
+            ));
+        }
+    }
+    for attribute in &element.attributes {
+        out.push_str(&format!(
+            r#" {}="{}""#,
+            attribute.name.prefixed_name(),
+            xml::escape_attr(&attribute.value)
+        ));
     }
 }
 
@@ -390,10 +525,69 @@ mod tests {
             dereference(&doc, &ids, "doc.txt", None),
             Err(Error::MissingSignedData)
         ));
+        let resolve = |_: &str| Ok(b"x".to_vec());
         assert!(matches!(
-            dereference(&doc, &ids, "doc.txt", Some(b"x")),
+            dereference(&doc, &ids, "doc.txt", Some(&resolve)),
             Ok(Data::Octets(_))
         ));
+    }
+
+    #[test]
+    fn relationship_transform() {
+        let rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+  <Relationship Id="rId2" Type="urn:t" Target="a&amp;b.xml"/>
+  <Relationship Id="rId1" Type="urn:office" Target="word/document.xml" TargetMode="External"/>
+</Relationships>"#;
+        let transform = Transform::Relationships {
+            ids: vec!["rId1".to_string()],
+            types: vec!["urn:t".to_string()],
+        };
+        let canonical = apply(
+            &bergshamra_xml::uppsala::parse("<x/>").unwrap(),
+            NodeId::new(0),
+            &Transform::C14n(C14nMode::Inclusive, vec![]),
+            apply(
+                &bergshamra_xml::uppsala::parse("<x/>").unwrap(),
+                NodeId::new(0),
+                &transform,
+                Data::Octets(rels.to_vec()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let Data::Octets(canonical) = canonical else {
+            panic!("octets expected");
+        };
+        assert_eq!(
+            String::from_utf8(canonical).unwrap(),
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="word/document.xml" TargetMode="External" Type="urn:office"></Relationship><Relationship Id="rId2" Target="a&amp;b.xml" TargetMode="Internal" Type="urn:t"></Relationship></Relationships>"#
+        );
+
+        // Written and read back.
+        let text = format!(
+            r#"<ds:Transforms xmlns:ds="{DSIG_NS}">{}</ds:Transforms>"#,
+            transform.to_xml("ds:")
+        );
+        let doc = bergshamra_xml::uppsala::parse(&text).unwrap();
+        let node = xml::child_elements(&doc, doc.document_element().unwrap())[0];
+        assert_eq!(Transform::parse(&doc, node).unwrap(), transform);
+    }
+
+    #[test]
+    fn exclusive_prefixes_round_trip() {
+        let transform = Transform::C14n(
+            C14nMode::from_uri("http://www.w3.org/2001/10/xml-exc-c14n#").unwrap(),
+            vec![String::new(), "ds".to_string()],
+        );
+        let text = format!(
+            r#"<ds:Transforms xmlns:ds="{DSIG_NS}">{}</ds:Transforms>"#,
+            transform.to_xml("ds:")
+        );
+        let doc = bergshamra_xml::uppsala::parse(&text).unwrap();
+        let node = xml::child_elements(&doc, doc.document_element().unwrap())[0];
+        assert_eq!(Transform::parse(&doc, node).unwrap(), transform);
     }
 
     #[test]

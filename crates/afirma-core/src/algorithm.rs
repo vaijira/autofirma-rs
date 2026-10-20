@@ -21,6 +21,9 @@ pub mod oid {
     /// id-messageDigest signed attribute.
     pub const MESSAGE_DIGEST: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+    /// id-countersignature unsigned attribute (RFC 5652).
+    pub const COUNTER_SIGNATURE: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.6");
     /// id-signingTime signed attribute.
     pub const SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
     /// id-aa-contentHint signed attribute (RFC 2634).
@@ -119,6 +122,18 @@ pub mod oid {
     /// id-aa-signatureTimeStampToken unsigned attribute (RFC 3161, CAdES-T).
     pub const SIGNATURE_TIMESTAMP_TOKEN: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
+    /// id-aa-ets-archiveTimestamp unsigned attribute (CAdES-A, RFC 5126).
+    pub const ARCHIVE_TIMESTAMP: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.27");
+    /// id-aa-ets-archiveTimestampV2 unsigned attribute (CAdES-A).
+    pub const ARCHIVE_TIMESTAMP_V2: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.48");
+    /// id-aa-ets-archiveTimestampV3 unsigned attribute (ETSI EN 319 122-2).
+    pub const ARCHIVE_TIMESTAMP_V3: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("0.4.0.1733.2.4");
+    /// id-aa-ets-longTermValidation unsigned attribute (ETSI TS 101 733).
+    pub const LONG_TERM_VALIDATION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("0.4.0.1733.2.2");
     /// id-kp-timeStamping extended key usage.
     pub const KP_TIME_STAMPING: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");

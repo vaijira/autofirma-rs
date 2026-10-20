@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    cades::SignerStatus, format::SignatureFormat, keystore::tests::load, policy::PolicyPreset,
-    tsp::tests::tsa_response,
+    cades::SignerStatus, format::SignatureFormat, keystore::tests::load,
+    multisign::CounterSignTarget, policy::PolicyPreset, tsp::tests::tsa_response,
 };
 
 // 2026-10-19T16:56:23Z
@@ -292,4 +292,232 @@ fn signature_timestamps() {
         "20261019165624Z",
     );
     assert!(add_timestamps(&signed, DigestAlgorithm::Sha512, &[other]).is_err());
+}
+
+#[test]
+fn cosign_every_format() {
+    let rsa = &load("rsa.p12")[0];
+    let ec = &load("ec.p12")[0];
+    for (data, format) in [
+        (fixture("doc.xml"), XadesFormat::Enveloping),
+        (fixture("doc.xml"), XadesFormat::Enveloped),
+        (fixture("doc.xml"), XadesFormat::Detached),
+        (fixture("doc.txt"), XadesFormat::Enveloping),
+        (fixture("doc.txt"), XadesFormat::Detached),
+    ] {
+        let signed = sign(&data, rsa, &params(format, DigestAlgorithm::Sha512, false)).unwrap();
+        let cosigned = cosign(
+            &signed,
+            None,
+            ec,
+            &params(format, DigestAlgorithm::Sha256, true),
+        )
+        .unwrap();
+        let report = verify(&cosigned, None).unwrap();
+        assert!(report.is_valid(), "{format:?}: {report:?}");
+        assert_eq!(report.signatures.len(), 2, "{format:?}");
+        assert!(report.signatures.iter().all(|s| s.signer.depth == 0));
+        // A third signature references the same data.
+        let third = cosign(
+            &cosigned,
+            None,
+            rsa,
+            &params(format, DigestAlgorithm::Sha384, false),
+        )
+        .unwrap();
+        let report = verify(&third, None).unwrap();
+        assert!(report.is_valid(), "{format:?}: {report:?}");
+        assert_eq!(report.signatures.len(), 3, "{format:?}");
+
+        let text = text(&cosigned);
+        match format {
+            // The enveloping signature is wrapped in an AFIRMA root, and its data copied.
+            XadesFormat::Enveloping => {
+                assert!(text.contains("<AFIRMA Id=\"AfirmaRoot-"), "{text}");
+                assert_eq!(
+                    text.matches("<ds:Object Encoding=").count()
+                        + text.matches("<ds:Object Id=\"Object-").count(),
+                    2
+                );
+            }
+            // Same root, with both signatures inside.
+            XadesFormat::Enveloped => assert!(text.contains("</ds:Signature><ds:Signature")),
+            XadesFormat::Detached => assert_eq!(text.matches("<CONTENT").count(), 1),
+        }
+    }
+}
+
+#[test]
+fn cosign_keeps_the_original_bytes() {
+    let key = &load("rsa.p12")[0];
+    let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<doc>Espa\xf1a</doc>\n";
+    let signed = sign(
+        latin1,
+        key,
+        &params(XadesFormat::Enveloped, DigestAlgorithm::Sha256, false),
+    )
+    .unwrap();
+    let cosigned = cosign(
+        &signed,
+        None,
+        key,
+        &params(XadesFormat::Enveloped, DigestAlgorithm::Sha256, false),
+    )
+    .unwrap();
+    // The new signature is inserted: the original document is a prefix of the result.
+    let end = signed.windows(6).rposition(|w| w == b"</doc>").unwrap();
+    assert_eq!(&cosigned[..end], &signed[..end]);
+    assert!(verify(&cosigned, None).unwrap().is_valid());
+}
+
+#[test]
+fn countersign_leafs_and_tree() {
+    let rsa = &load("rsa.p12")[0];
+    let ec = &load("ec.p12")[0];
+    for format in [XadesFormat::Enveloping, XadesFormat::Enveloped] {
+        let signed = sign(
+            &fixture("doc.xml"),
+            rsa,
+            &params(format, DigestAlgorithm::Sha512, false),
+        )
+        .unwrap();
+        let cosigned = cosign(
+            &signed,
+            None,
+            rsa,
+            &params(format, DigestAlgorithm::Sha512, false),
+        )
+        .unwrap();
+        let leafs = countersign(
+            &cosigned,
+            CounterSignTarget::Leafs,
+            ec,
+            &params(format, DigestAlgorithm::Sha256, false),
+        )
+        .unwrap();
+        let report = verify(&leafs, None).unwrap();
+        assert!(report.is_valid(), "{format:?}: {report:?}");
+        let depths: Vec<u32> = report.signatures.iter().map(|s| s.signer.depth).collect();
+        assert_eq!(depths, [0, 1, 0, 1], "{format:?}");
+
+        // Tree: every signature, the counter-signatures too.
+        let tree = countersign(
+            &leafs,
+            CounterSignTarget::Tree,
+            rsa,
+            &params(format, DigestAlgorithm::Sha512, true),
+        )
+        .unwrap();
+        let report = verify(&tree, None).unwrap();
+        assert!(report.is_valid(), "{format:?}: {report:?}");
+        let depths: Vec<u32> = report.signatures.iter().map(|s| s.signer.depth).collect();
+        assert_eq!(depths, [0, 1, 2, 1, 0, 1, 2, 1], "{format:?}");
+
+        // Leafs again: only the deepest signatures.
+        let again = countersign(
+            &tree,
+            CounterSignTarget::Leafs,
+            ec,
+            &params(format, DigestAlgorithm::Sha256, false),
+        )
+        .unwrap();
+        let report = verify(&again, None).unwrap();
+        assert!(report.is_valid(), "{format:?}: {report:?}");
+        assert_eq!(report.signatures.len(), 8 + 4);
+    }
+
+    // The counter-signature references the SignatureValue of its parent.
+    let signed = sign(
+        &fixture("doc.xml"),
+        rsa,
+        &params(XadesFormat::Enveloped, DigestAlgorithm::Sha512, false),
+    )
+    .unwrap();
+    let countersigned = countersign(
+        &signed,
+        CounterSignTarget::Leafs,
+        rsa,
+        &params(XadesFormat::Enveloped, DigestAlgorithm::Sha512, false),
+    )
+    .unwrap();
+    let text = text(&countersigned);
+    let counter = between(
+        &text,
+        "<xades:CounterSignature",
+        "</xades:CounterSignature>",
+    );
+    assert!(
+        counter.contains(r#"Type="http://uri.etsi.org/01903#CountersignedSignature""#),
+        "{counter}"
+    );
+    assert!(counter.contains(
+        "<xades:MimeType>text/xml</xades:MimeType><xades:Encoding>UTF-8</xades:Encoding>"
+    ));
+    assert!(text.contains("<xades:UnsignedProperties xmlns:xades="));
+}
+
+#[test]
+fn cosign_and_countersign_autofirma_signatures() {
+    let key = &load("ec.p12")[0];
+    for name in [
+        "autofirma-enveloping-rsa.xsig",
+        "autofirma-enveloped-rsa.xsig",
+        "autofirma-detached-rsa.xsig",
+        "autofirma-binary-enveloping-rsa.xsig",
+        "autofirma-enveloped-age-rsa.xsig",
+    ] {
+        let original = fixture(name);
+        let cosigned = cosign(&original, None, key, &XadesParams::new(SIGNING_TIME)).unwrap();
+        let report = verify(&cosigned, None).unwrap();
+        assert!(report.is_valid(), "{name}: {report:?}");
+        assert_eq!(report.signatures.len(), 2, "{name}");
+        let countersigned = countersign(
+            &original,
+            CounterSignTarget::Tree,
+            key,
+            &XadesParams::new(SIGNING_TIME),
+        )
+        .unwrap();
+        let report = verify(&countersigned, None).unwrap();
+        assert!(report.is_valid(), "{name}: {report:?}");
+        assert_eq!(report.signatures.len(), 2, "{name}");
+    }
+    // FacturaE invoices are counter-signed inside the invoice.
+    let invoice = fixture("autofirma-facturae-rsa.xsig");
+    let countersigned = countersign(
+        &invoice,
+        CounterSignTarget::Leafs,
+        key,
+        &XadesParams::new(SIGNING_TIME),
+    )
+    .unwrap();
+    assert!(verify(&countersigned, None).unwrap().is_valid());
+}
+
+#[test]
+fn verifies_autofirma_multisignatures() {
+    let report = verify(&fixture("autofirma-cosign-enveloping-rsa.xsig"), None).unwrap();
+    assert!(report.is_valid(), "{report:?}");
+    assert_eq!(report.signatures.len(), 2);
+    let report = verify(&fixture("autofirma-countersign-ec.xsig"), None).unwrap();
+    assert!(report.is_valid(), "{report:?}");
+    let depths: Vec<u32> = report.signatures.iter().map(|s| s.signer.depth).collect();
+    assert_eq!(depths, [0, 1]);
+    // And we add to them.
+    let key = &load("rsa.p12")[0];
+    for name in [
+        "autofirma-cosign-enveloping-rsa.xsig",
+        "autofirma-countersign-ec.xsig",
+    ] {
+        let cosigned = cosign(&fixture(name), None, key, &XadesParams::new(SIGNING_TIME)).unwrap();
+        assert!(verify(&cosigned, None).unwrap().is_valid(), "{name}");
+        let countersigned = countersign(
+            &fixture(name),
+            CounterSignTarget::Leafs,
+            key,
+            &XadesParams::new(SIGNING_TIME),
+        )
+        .unwrap();
+        assert!(verify(&countersigned, None).unwrap().is_valid(), "{name}");
+    }
 }

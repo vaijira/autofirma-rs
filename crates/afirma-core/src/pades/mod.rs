@@ -229,6 +229,12 @@ fn load(pdf: &[u8], password: Option<&str>) -> Result<Document> {
     Ok(doc)
 }
 
+/// Whether `pdf` has signatures. Encrypted PDFs, which cannot be read without
+/// their password, are reported unsigned.
+pub fn is_signed(pdf: &[u8]) -> bool {
+    info(pdf, None).is_ok_and(|info| info.signatures > 0)
+}
+
 /// Reads the pages, encryption and signatures of a PDF.
 pub fn info(pdf: &[u8], password: Option<&str>) -> Result<PdfInfo> {
     let doc = load(pdf, password)?;

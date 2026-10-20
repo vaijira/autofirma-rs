@@ -204,6 +204,11 @@ impl XmlText {
         }
     }
 
+    /// Name of the encoding of the output (`UTF-8`, `windows-1252`...).
+    pub fn encoding_name(&self) -> &'static str {
+        self.encoding.output_encoding().name()
+    }
+
     /// Decodes `data` using its byte order mark or its XML declaration (UTF-8 by default).
     pub fn decode(data: &[u8]) -> Result<Self> {
         let (encoding, bom) = match Encoding::for_bom(data) {
@@ -278,6 +283,40 @@ fn set_declared_encoding(text: &str, encoding: &str) -> String {
         );
     }
     text.to_string()
+}
+
+/// Offset of the end tag (`</name>`) of the element in `range` of `text`.
+pub(crate) fn end_tag_start(text: &str, range: std::ops::Range<usize>) -> Result<usize> {
+    text[range.clone()]
+        .rfind("</")
+        .map(|i| range.start + i)
+        .ok_or_else(|| Error::InvalidXml("falta la etiqueta de cierre".to_string()))
+}
+
+/// Offset just after the start tag of the element in `range` of `text`
+/// (`>` may appear inside attribute values).
+pub(crate) fn start_tag_end(text: &str, range: std::ops::Range<usize>) -> usize {
+    let mut quote = None;
+    for (i, c) in text[range.clone()].char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '>') => return range.start + i + 1,
+            _ => {}
+        }
+    }
+    range.end
+}
+
+/// Content of the element in `range` of `text`, between its start and end tags
+/// (empty for `<name/>`).
+pub(crate) fn inner_range(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    if text[range.clone()].ends_with("/>") {
+        return range.end..range.end;
+    }
+    let start = start_tag_end(text, range.clone());
+    let end = end_tag_start(text, range).unwrap_or(start).max(start);
+    start..end
 }
 
 /// Child elements of `id`.
@@ -365,6 +404,16 @@ mod tests {
         assert_eq!(raw.len(), 64);
         assert_eq!(ecdsa_value_to_der(KeyType::EcP256, &raw).unwrap(), der);
         assert!(ecdsa_value_to_der(KeyType::EcP384, &raw).is_none());
+    }
+
+    #[test]
+    fn tag_offsets() {
+        let text = r#"<r><a b="x>y">uno</a><c/></r>"#;
+        let a = 3..21;
+        assert_eq!(&text[a.clone()], r#"<a b="x>y">uno</a>"#);
+        assert_eq!(&text[inner_range(text, a.clone())], "uno");
+        assert_eq!(&text[end_tag_start(text, a).unwrap()..], "</a><c/></r>");
+        assert!(inner_range(text, 21..25).is_empty());
     }
 
     #[test]

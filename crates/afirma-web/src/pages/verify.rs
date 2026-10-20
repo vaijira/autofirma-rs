@@ -4,8 +4,10 @@ use afirma_core::{
     Error as CoreError,
     cades::{SignerReport, SignerStatus},
     job::{Job, JobOutput},
+    package::PackageReport,
     pades::{CertificationLevel, PdfSignatureReport},
     validation::Verification,
+    xades::XadesVerifyReport,
 };
 use dominator::{Dom, clone, events, html, with_node};
 use futures_signals::signal::{Mutable, SignalExt};
@@ -29,7 +31,7 @@ enum Missing {
     Password,
 }
 
-/// "Verificar" view: checks the integrity of CAdES signatures and signed PDFs.
+/// "Verificar" view: checks the integrity of signatures and signed documents.
 #[derive(Debug)]
 pub struct VerifyPage {
     worker: Rc<WorkerClient>,
@@ -99,7 +101,7 @@ impl VerifyPage {
     pub fn render(this: &Rc<Self>) -> Dom {
         let signature_picker = FilePicker::new(
             "verify_file",
-            "Seleccionar firma o PDF firmado",
+            "Seleccionar firma o documento firmado",
             "*/*",
             clone!(this => move |result| match result {
                 Ok(file) => {
@@ -129,7 +131,8 @@ impl VerifyPage {
                 html!("h2", { .text("Verificar") }),
                 html!("p", {
                     .text("Compruebe la integridad de una firma CAdES (.csig, .p7s), XAdES o FacturaE (.xsig, .xml), \
-                           de un contenedor ASiC-S (.asics) o de las firmas de un PDF. \
+                           de un contenedor ASiC-S (.asics) o de las firmas de un PDF o de un documento \
+                           OpenDocument (.odt, .ods, .odp) u Office (.docx, .xlsx, .pptx). \
                            Se verifica que los datos no han cambiado y que la firma corresponde al certificado; \
                            no se consulta la confianza ni la revocación del certificado.")
                 }),
@@ -207,13 +210,14 @@ fn describe(verification: &Verification) -> (String, Vec<Dom>) {
     match verification {
         Verification::Cades(report) => (
             format!(
-                "Firma CAdES {} con {} firmante(s).",
+                "Firma CAdES {} con {} firmante(s){}.",
                 if report.implicit {
                     "implícita"
                 } else {
                     "explícita"
                 },
-                report.signers.len()
+                report.signers.iter().filter(|s| s.depth == 0).count(),
+                countersignatures(report.signers.iter().filter(|s| s.depth > 0).count()),
             ),
             report
                 .signers
@@ -233,25 +237,25 @@ fn describe(verification: &Verification) -> (String, Vec<Dom>) {
                 .collect(),
         ),
         Verification::Xades(report) => (
-            format!("Documento XML con {} firma(s).", report.signatures.len()),
-            report
-                .signatures
-                .iter()
-                .map(|signature| {
-                    let mut extra = vec![(
-                        "Formato",
-                        if signature.xades { "XAdES" } else { "XMLDSig" }.to_string(),
-                    )];
-                    if !signature.claimed_roles.is_empty() {
-                        extra.push(("Papel", signature.claimed_roles.join(", ")));
-                    }
-                    if let Some(city) = &signature.production_city {
-                        extra.push(("Lugar", city.clone()));
-                    }
-                    render_signer(&signature.signer, None, &extra)
-                })
-                .collect(),
+            format!(
+                "Documento XML con {} firma(s){}.",
+                report
+                    .signatures
+                    .iter()
+                    .filter(|s| s.signer.depth == 0)
+                    .count(),
+                countersignatures(
+                    report
+                        .signatures
+                        .iter()
+                        .filter(|s| s.signer.depth > 0)
+                        .count()
+                ),
+            ),
+            xml_cards(report),
         ),
+        Verification::Odf(report) => describe_package("OpenDocument", report),
+        Verification::Ooxml(report) => describe_package("Office (OOXML)", report),
         Verification::Asic(report) => {
             let (summary, cards) = describe(&report.signature);
             (
@@ -263,6 +267,63 @@ fn describe(verification: &Verification) -> (String, Vec<Dom>) {
             )
         }
     }
+}
+
+/// `, con N contrafirma(s)` when there are counter-signatures.
+fn countersignatures(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(" y {count} contrafirma(s)")
+    }
+}
+
+/// One card per XML signature.
+fn xml_cards(report: &XadesVerifyReport) -> Vec<Dom> {
+    report
+        .signatures
+        .iter()
+        .map(|signature| {
+            let mut extra = vec![(
+                "Formato",
+                if signature.xades { "XAdES" } else { "XMLDSig" }.to_string(),
+            )];
+            if !signature.claimed_roles.is_empty() {
+                extra.push(("Papel", signature.claimed_roles.join(", ")));
+            }
+            if let Some(city) = &signature.production_city {
+                extra.push(("Lugar", city.clone()));
+            }
+            render_signer(&signature.signer, None, &extra)
+        })
+        .collect()
+}
+
+fn describe_package(kind: &str, report: &PackageReport) -> (String, Vec<Dom>) {
+    let mut summary = format!(
+        "Documento {kind} con {} firma(s).",
+        report.signatures.signatures.len()
+    );
+    let mut cards = xml_cards(&report.signatures);
+    if !report.unsigned_parts.is_empty() {
+        summary.push_str(" Hay partes del documento sin firmar.");
+        cards.push(html!("article", {
+            .class(&*CARD_CLASS)
+            .attr("id", "verify_unsigned_parts")
+            .attr("data-status", "invalid")
+            .children(&mut [
+                html!("p", {
+                    .style("margin", "0 0 0.5rem")
+                    .text("Partes que alguna firma no cubre (añadidas o cambiadas después de firmar):")
+                }),
+                html!("ul", {
+                    .style("margin", "0")
+                    .children(report.unsigned_parts.iter().map(|part| html!("li", { .text(part) })))
+                }),
+            ])
+        }));
+    }
+    (summary, cards)
 }
 
 fn status_text(status: &SignerStatus) -> String {
@@ -289,6 +350,15 @@ fn render_signer(
 ) -> Dom {
     let document_timestamp = pdf.is_some_and(|p| p.sub_filter == "ETSI.RFC3161");
     let mut rows: Vec<(&str, String)> = vec![("Estado", status_text(&signer.status))];
+    if signer.depth > 0 {
+        rows.push((
+            "Tipo",
+            match signer.depth {
+                1 => "Contrafirma".to_string(),
+                depth => format!("Contrafirma de nivel {depth}"),
+            },
+        ));
+    }
     rows.extend(extra.iter().cloned());
     if let Some(cert) = &signer.certificate {
         rows.push(("Firmante", cert.subject_cn.clone()));
@@ -371,6 +441,9 @@ fn render_signer(
 
     html!("article", {
         .class(&*CARD_CLASS)
+        // Counter-signatures under the signature they sign.
+        .style("margin-left", &format!("{}rem", 1.5 * signer.depth.min(4) as f32))
+        .attr("data-depth", &signer.depth.to_string())
         .attr("data-status", match signer.status {
             SignerStatus::Valid => "valid",
             _ => "invalid",

@@ -1,9 +1,11 @@
 # autofirma-rs
 
-Electronic signatures (CAdES, PAdES, XAdES…) in the browser, written in Rust and compiled to
-WebAssembly with [dominator](https://github.com/Pauan/rust-dominator). It is a port of the
-current features of the Spanish government's [AutoFirma](https://github.com/ctt-gob-es/clienteafirma)
-client. Files never leave the user's machine.
+Electronic signatures (CAdES, PAdES, XAdES, FacturaE, ASiC-S, ODF and OOXML) in the browser,
+written in Rust and compiled to WebAssembly with [dominator](https://github.com/Pauan/rust-dominator).
+It signs, co-signs and counter-signs, signs many files at once, signs batches of AutoFirma's
+batch service and verifies signatures. It is a port of the current features of the Spanish
+government's [AutoFirma](https://github.com/ctt-gob-es/clienteafirma) client. Files never leave
+the user's machine.
 
 ## Layout
 
@@ -38,17 +40,23 @@ cargo clippy --target wasm32-unknown-unknown -p afirma-core -p afirma-web -p afi
 
 Cross-validation with AutoFirma itself: this signs CAdES with every key, digest, mode and
 policy combination, PAdES with every PDF variant (xref streams, encryption, visible,
-certified, co-signed), XAdES in every layout and ASiC-S containers, and timestamps them with
-`openssl ts` acting as TSA. It then checks the results with AutoFirma's validators
+certified, co-signed), XAdES in every layout, ASiC-S containers, ODF and OOXML documents, and
+CAdES and XAdES co-signatures and counter-signatures, and timestamps them with `openssl ts`
+acting as TSA. It then checks the results with AutoFirma's validators
 ([tools/AfirmaValidate.java](tools/AfirmaValidate.java)), `openssl cms -verify`, the JDK's
-XMLDSig, poppler's `pdfsig` and `qpdf --check`. It needs Java, OpenSSL, poppler-utils, qpdf and
-AutoFirma installed:
+XMLDSig (with AutoFirma's relationship transform for OOXML), LibreOffice for ODF
+([tools/lo_verify.py](tools/lo_verify.py)), poppler's `pdfsig` and `qpdf --check`. AutoFirma's
+own signers also co-sign and counter-sign our signatures and sign our office documents again
+([tools/AfirmaMulti.java](tools/AfirmaMulti.java)), and we verify the results. It needs Java,
+OpenSSL, poppler-utils, qpdf, LibreOffice with python3-uno and AutoFirma installed, and a
+display (`DISPLAY`), since AutoFirma's OOXML signer reads the screen size:
 
 ```sh
 cargo test -p afirma-core --test autofirma_interop -- --ignored
 ```
 
-Triphase signing (CAdES, PAdES, XAdES and FacturaE) is tested against the pre/post processors of clienteafirma's
+Triphase signing (CAdES, PAdES, XAdES and FacturaE, and CAdES and XAdES co-signatures and
+counter-signatures) is tested against the pre/post processors of clienteafirma's
 `afirma-server-triphase-signer`. [tools/triphase-server/run.sh](tools/triphase-server/run.sh)
 downloads them (pinned to AutoFirma 1.9), compiles them against `autofirma.jar` with a small
 HTTP wrapper and serves them on port 8090. It needs a JDK:
@@ -62,7 +70,8 @@ Test keystores live in `tests/data/certs` (password `1234`; regenerate them with
 Test PDFs live in `tests/data/pades` (regenerate them with `generate.sh`; the encrypted ones use
 the passwords `user` and `owner`). XML documents and a FacturaE invoice live in `tests/data/xades`.
 Reference signatures made by AutoFirma live in `tests/data/cades`, `tests/data/pades/autofirma-*.pdf`,
-`tests/data/xades/autofirma-*.xsig` and `tests/data/asic` (each `generate.sh` lists how).
+`tests/data/xades/autofirma-*.xsig`, `tests/data/asic`, `tests/data/odf` and `tests/data/ooxml`
+(each `generate.sh` lists how), co-signed and counter-signed ones included.
 
 The end-to-end tests need a built `dist/`. To run them with Selenium in Docker:
 

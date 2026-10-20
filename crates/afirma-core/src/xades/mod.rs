@@ -38,10 +38,13 @@ use crate::{
     },
 };
 
+mod multi;
 pub(crate) mod reference;
 mod verify;
 
+pub use multi::{cosign, countersign};
 use reference::{Ids, Transform};
+pub(crate) use verify::verify_with;
 pub use verify::{XadesSignatureReport, XadesVerifyReport, verify};
 
 /// Where the signed data goes (AutoFirma's `format`).
@@ -168,11 +171,22 @@ impl PreparedXades {
 
     /// Builds the signed XML document from the raw signature value (PKCS#1, or
     /// DER encoded ECDSA as [`SigningKey::sign_raw`] returns it).
-    pub fn finish(mut self, signature: &[u8]) -> Result<Vec<u8>> {
+    pub fn finish(self, signature: &[u8]) -> Result<Vec<u8>> {
+        let output = self.output.clone();
+        Ok(output.encode(&self.finish_text(signature)?))
+    }
+
+    /// The document as text, without the signature value.
+    pub(crate) fn into_text(self) -> String {
+        self.text
+    }
+
+    /// The signed document as text (before encoding it).
+    pub(crate) fn finish_text(mut self, signature: &[u8]) -> Result<String> {
         let value = xml::signature_value(self.key_type, signature)?;
         self.text
             .insert_str(self.signature_value_at, &base64(&value));
-        Ok(self.output.encode(&self.text))
+        Ok(self.text)
     }
 }
 
@@ -252,7 +266,7 @@ enum Placement<'a> {
 
 /// A file name as a relative URI reference: bytes other than unreserved
 /// characters and `/` are percent-encoded.
-fn uri_path(name: &str) -> String {
+pub(crate) fn uri_path(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for b in name.bytes() {
         match b {
@@ -266,11 +280,46 @@ fn uri_path(name: &str) -> String {
 }
 
 /// A reference of `SignedInfo`.
-struct Reference {
-    id: Option<String>,
-    type_uri: Option<&'static str>,
-    uri: String,
-    transforms: Vec<Transform>,
+#[derive(Debug, Clone)]
+pub(crate) struct Reference {
+    pub id: Option<String>,
+    pub type_uri: Option<String>,
+    pub uri: String,
+    pub transforms: Vec<Transform>,
+}
+
+/// `DataObjectFormat` of a data reference.
+#[derive(Debug, Clone)]
+pub(crate) struct DataFormat {
+    /// `Id` of the reference.
+    pub reference_id: String,
+    pub mime: String,
+    pub encoding: Option<String>,
+}
+
+/// A `ds:Signature` to place in a document.
+#[derive(Debug)]
+pub(crate) struct NewSignature {
+    /// `Signature-<uuid>`: base of the ids of the signature's elements.
+    pub base: String,
+    /// References to the signed data. Those to the `SignedProperties` and the
+    /// `KeyInfo` are added after them.
+    pub references: Vec<Reference>,
+    /// `ds:Object` elements with signed data (enveloping signatures).
+    pub objects: Vec<String>,
+    /// `DataObjectFormat` of the data references.
+    pub formats: Vec<DataFormat>,
+}
+
+impl NewSignature {
+    pub fn new() -> Result<Self> {
+        Ok(NewSignature {
+            base: format!("Signature-{}", random::uuid()?),
+            references: Vec::new(),
+            objects: Vec::new(),
+            formats: Vec::new(),
+        })
+    }
 }
 
 pub(crate) fn prepare_with(
@@ -283,9 +332,6 @@ pub(crate) fn prepare_with(
     if data.is_empty() {
         return Err(Error::EmptyData);
     }
-    let leaf = chain
-        .first()
-        .ok_or_else(|| Error::Certificate("falta el certificado del firmante".to_string()))?;
 
     // Binary data (anything that is not well formed XML) travels in Base64.
     let xml_data = match DataKind::detect(data) {
@@ -302,7 +348,7 @@ pub(crate) fn prepare_with(
         mime_type(data)
     };
 
-    let base = format!("Signature-{}", random::uuid()?);
+    let mut signature = NewSignature::new()?;
     let data_reference_id = format!("Reference-{}", random::uuid()?);
     let declaration = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
     let (content, content_transform, encoding) = match &xml_data {
@@ -326,7 +372,6 @@ pub(crate) fn prepare_with(
     };
 
     // The document around the signature and the data reference.
-    let mut enveloping_object = None;
     let placement = match profile.asic_file {
         Some(file_name) => Placement::Asic(file_name),
         None => Placement::Format(params.format),
@@ -362,10 +407,7 @@ pub(crate) fn prepare_with(
                     format!("</{}>{}", xml_data.root_name, &text[xml_data.root.end..]),
                 )
             } else {
-                let end_tag = xml_data.root.start
-                    + root_text
-                        .rfind("</")
-                        .ok_or_else(|| Error::InvalidXml("falta la etiqueta de cierre".into()))?;
+                let end_tag = xml::end_tag_start(text, xml_data.root.clone())?;
                 (text[..end_tag].to_string(), text[end_tag..].to_string())
             };
             let mut transforms = vec![Transform::Enveloped];
@@ -389,13 +431,13 @@ pub(crate) fn prepare_with(
         }
         Placement::Format(XadesFormat::Enveloping) => {
             let object_id = format!("Object-{}", random::uuid()?);
-            enveloping_object = Some(format!(
+            signature.objects.push(format!(
                 "<ds:Object{}>{content}</ds:Object>",
                 content_attributes(&object_id)
             ));
             let reference = Reference {
                 id: Some(data_reference_id.clone()),
-                type_uri: Some(uri::OBJECT_TYPE),
+                type_uri: Some(uri::OBJECT_TYPE.to_string()),
                 uri: format!("#{object_id}"),
                 transforms: content_transform.into_iter().collect(),
             };
@@ -422,85 +464,145 @@ pub(crate) fn prepare_with(
             (prefix, "</AFIRMA>".to_string(), reference, XmlText::utf8())
         }
     };
+    signature.references.push(data_reference);
+    signature.formats.push(DataFormat {
+        reference_id: data_reference_id,
+        mime,
+        encoding: encoding.map(str::to_string),
+    });
 
-    let references = [
-        data_reference,
-        Reference {
-            id: None,
-            type_uri: Some(uri::SIGNED_PROPERTIES_TYPE),
-            uri: format!("#{base}-SignedProperties"),
-            transforms: Vec::new(),
-        },
-        Reference {
-            id: None,
-            type_uri: None,
-            uri: format!("#{base}-KeyInfo"),
-            transforms: Vec::new(),
-        },
-    ];
+    let resolve = |_: &str| Ok(data.to_vec());
+    let external: reference::External<'_> = profile.asic_file.map(|_| &resolve as _);
+    assemble(
+        &prefix, &suffix, output, signature, chain, key_type, params, external,
+    )
+}
+
+/// Builds the document `prefix`, `signature`, `suffix` and computes the digests
+/// of the signature's references and its `SignedInfo`, ready to be signed.
+///
+/// `external` resolves references to data outside the document.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble(
+    prefix: &str,
+    suffix: &str,
+    output: XmlText,
+    new: NewSignature,
+    chain: &[Certificate],
+    key_type: KeyType,
+    params: &XadesParams,
+    external: reference::External<'_>,
+) -> Result<PreparedXades> {
+    let leaf = chain
+        .first()
+        .ok_or_else(|| Error::Certificate("falta el certificado del firmante".to_string()))?;
+    let base = &new.base;
+    let mut references = new.references;
+    references.push(Reference {
+        id: None,
+        type_uri: Some(uri::SIGNED_PROPERTIES_TYPE.to_string()),
+        uri: format!("#{base}-SignedProperties"),
+        transforms: Vec::new(),
+    });
+    references.push(Reference {
+        id: None,
+        type_uri: None,
+        uri: format!("#{base}-KeyInfo"),
+        transforms: Vec::new(),
+    });
 
     // The signature, with empty `DigestValue`s and `SignatureValue`.
-    let digest_method = format!(
-        r#"<ds:DigestMethod Algorithm="{}"/>"#,
-        digest_uri(params.digest)
-    );
     let mut signature = format!(
         r#"<ds:Signature xmlns:ds="{DSIG_NS}" Id="{base}-Signature"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="{}"/><ds:SignatureMethod Algorithm="{}"/>"#,
         uri::C14N,
         signature_method_uri(key_type, params.digest)
     );
-    let mut digest_slots = Vec::new();
-    for reference in &references {
-        signature.push_str("<ds:Reference");
-        if let Some(id) = &reference.id {
-            signature.push_str(&format!(r#" Id="{id}""#));
-        }
-        if let Some(type_uri) = reference.type_uri {
-            signature.push_str(&format!(r#" Type="{type_uri}""#));
-        }
-        signature.push_str(&format!(r#" URI="{}">"#, escape_attr(&reference.uri)));
-        if !reference.transforms.is_empty() {
-            signature.push_str("<ds:Transforms>");
-            for transform in &reference.transforms {
-                signature.push_str(&transform.to_xml());
-            }
-            signature.push_str("</ds:Transforms>");
-        }
-        signature.push_str(&digest_method);
-        signature.push_str("<ds:DigestValue>");
-        digest_slots.push(signature.len());
-        signature.push_str("</ds:DigestValue></ds:Reference>");
-    }
+    let digest_slots = write_references(&mut signature, "ds:", &references, params.digest);
     signature.push_str(&format!(
         r#"</ds:SignedInfo><ds:SignatureValue Id="{base}-SignatureValue">"#
     ));
     let signature_value_slot = signature.len();
     signature.push_str("</ds:SignatureValue>");
-    signature.push_str(&key_info(&base, chain, key_type)?);
-    if let Some(object) = enveloping_object {
-        signature.push_str(&object);
+    signature.push_str(&key_info(base, chain, key_type)?);
+    for object in &new.objects {
+        signature.push_str(object);
     }
     signature.push_str(&format!(
         r##"<ds:Object><xades:QualifyingProperties xmlns:xades="{XADES_NS}" Id="{base}-QualifyingProperties" Target="#{base}-Signature">"##
     ));
-    signature.push_str(&signed_properties(
-        &base,
-        leaf,
-        params,
-        &data_reference_id,
-        &mime,
-        encoding,
-    )?);
+    signature.push_str(&signed_properties(base, leaf, params, &new.formats, false)?);
     signature.push_str("</xades:QualifyingProperties></ds:Object></ds:Signature>");
 
     let offset = prefix.len();
-    let mut text = format!("{prefix}{signature}{suffix}");
+    complete(
+        format!("{prefix}{signature}{suffix}"),
+        &format!("{base}-Signature"),
+        &references,
+        digest_slots.iter().map(|slot| offset + slot).collect(),
+        offset + signature_value_slot,
+        params.digest,
+        key_type,
+        output,
+        external,
+    )
+}
 
-    // Digests of the references, in the final document.
+/// Writes the `Reference` elements of `references` with empty `DigestValue`s
+/// and returns the offsets in `out` of those empty values. `p` is the prefix
+/// of the XMLDSig namespace (`ds:`, or empty for the default namespace).
+pub(crate) fn write_references(
+    out: &mut String,
+    p: &str,
+    references: &[Reference],
+    digest: DigestAlgorithm,
+) -> Vec<usize> {
+    let digest_method = format!(r#"<{p}DigestMethod Algorithm="{}"/>"#, digest_uri(digest));
+    let mut slots = Vec::new();
+    for reference in references {
+        out.push_str(&format!("<{p}Reference"));
+        if let Some(id) = &reference.id {
+            out.push_str(&format!(r#" Id="{}""#, escape_attr(id)));
+        }
+        if let Some(type_uri) = &reference.type_uri {
+            out.push_str(&format!(r#" Type="{}""#, escape_attr(type_uri)));
+        }
+        out.push_str(&format!(r#" URI="{}">"#, escape_attr(&reference.uri)));
+        if !reference.transforms.is_empty() {
+            out.push_str(&format!("<{p}Transforms>"));
+            for transform in &reference.transforms {
+                out.push_str(&transform.to_xml(p));
+            }
+            out.push_str(&format!("</{p}Transforms>"));
+        }
+        out.push_str(&digest_method);
+        out.push_str(&format!("<{p}DigestValue>"));
+        slots.push(out.len());
+        out.push_str(&format!("</{p}DigestValue></{p}Reference>"));
+    }
+    slots
+}
+
+/// Completes a signature in its final document `text`: computes the digests
+/// of `references` and inserts them at `digest_slots` (offsets in `text`, from
+/// [`write_references`]), then canonicalizes the `SignedInfo` of the
+/// `ds:Signature` with id `signature_id`. The signature value goes at
+/// `signature_value_slot`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn complete(
+    mut text: String,
+    signature_id: &str,
+    references: &[Reference],
+    digest_slots: Vec<usize>,
+    signature_value_slot: usize,
+    digest: DigestAlgorithm,
+    key_type: KeyType,
+    output: XmlText,
+    external: reference::External<'_>,
+) -> Result<PreparedXades> {
     let digests = {
         let doc = uppsala::parse(&text).map_err(|e| Error::InvalidXml(e.to_string()))?;
         let ids = Ids::new(&doc);
-        let signature_node = ids.get(&format!("{base}-Signature"))?;
+        let signature_node = ids.get(signature_id)?;
         references
             .iter()
             .map(|reference| {
@@ -510,29 +612,25 @@ pub(crate) fn prepare_with(
                     signature_node,
                     &reference.uri,
                     &reference.transforms,
-                    params.digest,
-                    profile.asic_file.map(|_| data),
+                    digest,
+                    external,
                 )
                 .map(|digest| base64(&digest))
             })
             .collect::<Result<Vec<_>>>()?
     };
-    for (slot, digest) in digest_slots.iter().zip(&digests).rev() {
-        text.insert_str(offset + slot, digest);
+    let mut inserted = 0;
+    for (slot, value) in digest_slots.iter().zip(&digests) {
+        text.insert_str(slot + inserted, value);
+        inserted += value.len();
     }
-    let signature_value_at =
-        offset + signature_value_slot + digests.iter().map(String::len).sum::<usize>();
+    let signature_value_at = signature_value_slot + inserted;
 
     let to_be_signed = {
         let doc = uppsala::parse(&text).map_err(|e| Error::InvalidXml(e.to_string()))?;
         let ids = Ids::new(&doc);
-        let signed_info = xml::child(
-            &doc,
-            ids.get(&format!("{base}-Signature"))?,
-            DSIG_NS,
-            "SignedInfo",
-        )
-        .ok_or_else(|| Error::InvalidXml("falta SignedInfo".to_string()))?;
+        let signed_info = xml::child(&doc, ids.get(signature_id)?, DSIG_NS, "SignedInfo")
+            .ok_or_else(|| Error::InvalidXml("falta SignedInfo".to_string()))?;
         reference::canonicalize_element(&doc, signed_info, C14nMode::Inclusive, &[])?
     };
 
@@ -546,7 +644,7 @@ pub(crate) fn prepare_with(
 }
 
 /// `ds:KeyInfo`: the certificate chain and, for RSA, the public key.
-fn key_info(base: &str, chain: &[Certificate], key_type: KeyType) -> Result<String> {
+pub(crate) fn key_info(base: &str, chain: &[Certificate], key_type: KeyType) -> Result<String> {
     let mut out = format!(r#"<ds:KeyInfo Id="{base}-KeyInfo"><ds:X509Data>"#);
     for cert in chain {
         out.push_str(&format!(
@@ -575,14 +673,14 @@ struct RsaPublicKey<'a> {
     public_exponent: UintRef<'a>,
 }
 
-/// `xades:SignedProperties`.
-fn signed_properties(
+/// `xades:SignedProperties`. Without a policy, `implied_policy` writes
+/// `SignaturePolicyImplied` (XAdES-EPES with an implicit policy, as in OOXML).
+pub(crate) fn signed_properties(
     base: &str,
     leaf: &Certificate,
     params: &XadesParams,
-    data_reference_id: &str,
-    mime: &str,
-    encoding: Option<&str>,
+    formats: &[DataFormat],
+    implied_policy: bool,
 ) -> Result<String> {
     let digest_method =
         |digest| format!(r#"<ds:DigestMethod Algorithm="{}"/>"#, digest_uri(digest));
@@ -605,6 +703,10 @@ fn signed_properties(
             policy,
             digest_method(policy.hash_algorithm),
         ));
+    } else if implied_policy {
+        out.push_str(
+            "<xades:SignaturePolicyIdentifier><xades:SignaturePolicyImplied/></xades:SignaturePolicyIdentifier>",
+        );
     }
 
     let place = &params.production_place;
@@ -644,25 +746,34 @@ fn signed_properties(
     out.push_str("</xades:SignedSignatureProperties>");
 
     // DataObjectFormat, with the OID of the MIME type when AutoFirma knows one.
-    out.push_str(&format!(
-        r##"<xades:SignedDataObjectProperties><xades:DataObjectFormat ObjectReference="#{data_reference_id}"><xades:Description/>"##
-    ));
-    if let Some(oid) = mime_type_oid(mime) {
-        out.push_str(&format!(
-            r#"<xades:ObjectIdentifier><xades:Identifier Qualifier="OIDAsURN">urn:oid:{oid}</xades:Identifier><xades:Description/></xades:ObjectIdentifier>"#
-        ));
+    if !formats.is_empty() {
+        out.push_str("<xades:SignedDataObjectProperties>");
+        for format in formats {
+            out.push_str(&format!(
+                r##"<xades:DataObjectFormat ObjectReference="#{}"><xades:Description/>"##,
+                escape_attr(&format.reference_id)
+            ));
+            if let Some(oid) = mime_type_oid(&format.mime) {
+                out.push_str(&format!(
+                    r#"<xades:ObjectIdentifier><xades:Identifier Qualifier="OIDAsURN">urn:oid:{oid}</xades:Identifier><xades:Description/></xades:ObjectIdentifier>"#
+                ));
+            }
+            out.push_str(&format!(
+                "<xades:MimeType>{}</xades:MimeType>",
+                escape_text(&format.mime)
+            ));
+            match &format.encoding {
+                Some(encoding) => out.push_str(&format!(
+                    "<xades:Encoding>{}</xades:Encoding>",
+                    escape_text(encoding)
+                )),
+                None => out.push_str("<xades:Encoding/>"),
+            }
+            out.push_str("</xades:DataObjectFormat>");
+        }
+        out.push_str("</xades:SignedDataObjectProperties>");
     }
-    out.push_str(&format!(
-        "<xades:MimeType>{}</xades:MimeType>",
-        escape_text(mime)
-    ));
-    match encoding {
-        Some(encoding) => out.push_str(&format!("<xades:Encoding>{encoding}</xades:Encoding>")),
-        None => out.push_str("<xades:Encoding/>"),
-    }
-    out.push_str(
-        "</xades:DataObjectFormat></xades:SignedDataObjectProperties></xades:SignedProperties>",
-    );
+    out.push_str("</xades:SignedProperties>");
     Ok(out)
 }
 
@@ -692,6 +803,22 @@ fn signature_policy(policy: &SignaturePolicy, digest_method: String) -> String {
     }
     out.push_str("</xades:SignaturePolicyId></xades:SignaturePolicyIdentifier>");
     out
+}
+
+/// Whether `xml` is an XML document with XML signatures (`ds:Signature`).
+pub fn is_signed(xml: &[u8]) -> bool {
+    const NEEDLE: &[u8] = DSIG_NS.as_bytes();
+    if !xml.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return false;
+    }
+    let Ok(source) = XmlText::decode(xml) else {
+        return false;
+    };
+    uppsala::parse(&source.text).is_ok_and(|doc| {
+        doc.descendants(doc.root())
+            .into_iter()
+            .any(|node| xml::is_element(&doc, node, DSIG_NS, "Signature"))
+    })
 }
 
 /// `ds:Signature` elements with XAdES properties and no signature timestamp,
@@ -799,8 +926,7 @@ pub fn add_timestamps(
         if element_text.ends_with("/>") {
             return Err(Error::Unsupported("propiedades XAdES vacías".to_string()));
         }
-        let end_tag = range.start + element_text.rfind("</").expect("closing tag");
-        insertions.push((end_tag, text));
+        insertions.push((xml::end_tag_start(&source.text, range)?, text));
     }
     if let Some(response) = pending.first() {
         crate::tsp::parse_response(response)?;

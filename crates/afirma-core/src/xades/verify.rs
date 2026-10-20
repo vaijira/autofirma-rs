@@ -33,6 +33,10 @@ pub struct XadesSignatureReport {
     pub production_city: Option<String>,
     /// Verification of the signature.
     pub signer: SignerReport,
+    /// URIs of the references of the signature and of its manifests, to know
+    /// which parts of a package it covers.
+    #[serde(skip)]
+    pub(crate) uris: Vec<String>,
 }
 
 /// Result of verifying the XML signatures of a document.
@@ -59,6 +63,19 @@ impl XadesVerifyReport {
 /// outside the document (as in ASiC containers). Certificate trust and
 /// revocation are not checked.
 pub fn verify(xml: &[u8], data: Option<&[u8]>) -> Result<XadesVerifyReport> {
+    let resolve = |_: &str| data.map(<[u8]>::to_vec).ok_or(Error::MissingSignedData);
+    verify_with(xml, data.map(|_| &resolve as _), false)
+}
+
+/// Verifies the XML signatures of `xml`, resolving the references to data
+/// outside the document with `external`. With `check_manifests`, the
+/// references of the `ds:Manifest`s inside the signatures are checked too
+/// (OOXML packages sign their parts through one).
+pub(crate) fn verify_with(
+    xml: &[u8],
+    external: External<'_>,
+    check_manifests: bool,
+) -> Result<XadesVerifyReport> {
     let source = XmlText::decode(xml)?;
     let doc = uppsala::parse(&source.text).map_err(|e| Error::InvalidXml(e.to_string()))?;
     let ids = Ids::new(&doc);
@@ -74,7 +91,17 @@ pub fn verify(xml: &[u8], data: Option<&[u8]>) -> Result<XadesVerifyReport> {
     }
     let signatures = signatures
         .into_iter()
-        .map(|signature| verify_signature(&doc, &ids, signature, data))
+        .map(|signature| {
+            let mut report = verify_signature(&doc, &ids, signature, external, check_manifests)?;
+            report.signer.depth = u32::try_from(
+                doc.ancestors(signature)
+                    .into_iter()
+                    .filter(|&node| xml::is_element(&doc, node, DSIG_NS, "Signature"))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX);
+            Ok(report)
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(XadesVerifyReport { signatures })
 }
@@ -105,11 +132,54 @@ struct CheckedReference {
     valid: bool,
 }
 
+/// Digest of a `ds:Reference` element, and the one it declares. `None` when it
+/// uses something not supported (the reason in the error string).
+fn check_reference(
+    doc: &Document<'_>,
+    ids: &Ids,
+    signature: NodeId,
+    reference: NodeId,
+    external: External<'_>,
+) -> Result<std::result::Result<CheckedReference, String>> {
+    let uri = doc
+        .get_attribute(reference, "URI")
+        .unwrap_or_default()
+        .to_string();
+    let transforms = match xml::child(doc, reference, DSIG_NS, "Transforms") {
+        Some(list) => xml::children(doc, list, DSIG_NS, "Transform")
+            .into_iter()
+            .map(|transform| Transform::parse(doc, transform))
+            .collect::<Result<Vec<_>>>(),
+        None => Ok(Vec::new()),
+    };
+    let algorithm = xml::child(doc, reference, DSIG_NS, "DigestMethod")
+        .and_then(|m| doc.get_attribute(m, "Algorithm"))
+        .unwrap_or_default();
+    let (transforms, Some(algorithm)) = (transforms, digest_from_uri(algorithm)) else {
+        return Ok(Err(algorithm.to_string()));
+    };
+    let transforms = match transforms {
+        Ok(transforms) => transforms,
+        Err(Error::Unsupported(what)) => return Ok(Err(what)),
+        Err(e) => return Err(e),
+    };
+    let expected = xml::child(doc, reference, DSIG_NS, "DigestValue")
+        .and_then(|value| decode_base64(&doc.text_content_deep(value)))
+        .ok_or_else(|| invalid("DigestValue no válido"))?;
+    let computed = reference::digest(doc, ids, signature, &uri, &transforms, algorithm, external)?;
+    Ok(Ok(CheckedReference {
+        valid: computed == expected,
+        type_uri: doc.get_attribute(reference, "Type").map(str::to_string),
+        uri,
+    }))
+}
+
 fn verify_signature(
     doc: &Document<'_>,
     ids: &Ids,
     signature: NodeId,
     external: External<'_>,
+    check_manifests: bool,
 ) -> Result<XadesSignatureReport> {
     let mut report = XadesSignatureReport {
         id: doc.get_attribute(signature, "Id").map(str::to_string),
@@ -123,7 +193,9 @@ fn verify_signature(
             policy: None,
             status: SignerStatus::Valid,
             timestamps: Vec::new(),
+            depth: 0,
         },
+        uris: Vec::new(),
     };
 
     let signed_info = xml::child(doc, signature, DSIG_NS, "SignedInfo")
@@ -147,43 +219,33 @@ fn verify_signature(
     // References.
     let mut references = Vec::new();
     for reference in xml::children(doc, signed_info, DSIG_NS, "Reference") {
-        let uri = doc
-            .get_attribute(reference, "URI")
-            .unwrap_or_default()
-            .to_string();
-        let transforms = match xml::child(doc, reference, DSIG_NS, "Transforms") {
-            Some(list) => xml::children(doc, list, DSIG_NS, "Transform")
-                .into_iter()
-                .map(|transform| Transform::parse(doc, transform))
-                .collect::<Result<Vec<_>>>(),
-            None => Ok(Vec::new()),
-        };
-        let algorithm = xml::child(doc, reference, DSIG_NS, "DigestMethod")
-            .and_then(|m| doc.get_attribute(m, "Algorithm"))
-            .unwrap_or_default();
-        let (transforms, Some(algorithm)) = (transforms, digest_from_uri(algorithm)) else {
-            report.signer.status = SignerStatus::Unsupported(algorithm.to_string());
-            return Ok(report);
-        };
-        let transforms = match transforms {
-            Ok(transforms) => transforms,
-            Err(Error::Unsupported(what)) => {
-                report.signer.status = SignerStatus::Unsupported(what);
+        match check_reference(doc, ids, signature, reference, external)? {
+            Ok(checked) => references.push(checked),
+            Err(unsupported) => {
+                report.signer.status = SignerStatus::Unsupported(unsupported);
                 return Ok(report);
             }
-            Err(e) => return Err(e),
-        };
-        let expected = xml::child(doc, reference, DSIG_NS, "DigestValue")
-            .and_then(|value| decode_base64(&doc.text_content_deep(value)))
-            .ok_or_else(|| invalid("DigestValue no válido"))?;
-        let computed =
-            reference::digest(doc, ids, signature, &uri, &transforms, algorithm, external)?;
-        references.push(CheckedReference {
-            valid: computed == expected,
-            type_uri: doc.get_attribute(reference, "Type").map(str::to_string),
-            uri,
-        });
+        }
     }
+    // Manifests (OOXML): their references are checked like those of SignedInfo.
+    if check_manifests {
+        let manifests: Vec<NodeId> = xml::children(doc, signature, DSIG_NS, "Object")
+            .into_iter()
+            .flat_map(|object| xml::children(doc, object, DSIG_NS, "Manifest"))
+            .collect();
+        for manifest in manifests {
+            for reference in xml::children(doc, manifest, DSIG_NS, "Reference") {
+                match check_reference(doc, ids, signature, reference, external)? {
+                    Ok(checked) => references.push(checked),
+                    Err(unsupported) => {
+                        report.signer.status = SignerStatus::Unsupported(unsupported);
+                        return Ok(report);
+                    }
+                }
+            }
+        }
+    }
+    report.uris = references.iter().map(|r| r.uri.clone()).collect();
     if references.is_empty() {
         return Err(invalid("la firma no tiene referencias"));
     }

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cades::{CadesParams, SignatureMode},
     facturae::FacturaeParams,
+    format::SignatureFormat,
+    multisign::{MultiSignOperation, MultiSignParams},
     pades::{
         CertificationLevel, FontColor, FontFamily, PadesParams, SignaturePages, VisibleSignature,
     },
@@ -210,6 +212,26 @@ impl From<&FacturaeParams> for ExtraParams {
     fn from(params: &FacturaeParams) -> Self {
         let mut extra = ExtraParams::default();
         extra.set_place_and_roles(&params.production_place, &[params.role.name().to_string()]);
+        extra
+    }
+}
+
+impl ExtraParams {
+    /// Parameters of a co-signature or counter-signature in `format` (CAdES or
+    /// XAdES); counter-signatures name their `target` (`tree` or `leafs`).
+    pub fn multisign(
+        params: &MultiSignParams,
+        operation: MultiSignOperation,
+        format: SignatureFormat,
+    ) -> Self {
+        let mut extra = ExtraParams::default();
+        if let Some(preset) = params.policy {
+            extra.set_policy(&preset.policy(format));
+        }
+        extra.set_place_and_roles(&params.production_place, &params.claimed_roles);
+        if let MultiSignOperation::Countersign(target) = operation {
+            extra.set("target", target.name());
+        }
         extra
     }
 }

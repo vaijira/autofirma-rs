@@ -7,6 +7,8 @@ use crate::{
     cades::{self, VerifyReport},
     error::{Error, Result},
     format::DataKind,
+    odf, ooxml,
+    package::PackageReport,
     pades::{self, PdfVerifyReport},
     xades::{self, XadesVerifyReport},
 };
@@ -22,6 +24,10 @@ pub enum Verification {
     Xades(XadesVerifyReport),
     /// ASiC-S container.
     Asic(AsicReport),
+    /// Signatures of an ODF document.
+    Odf(PackageReport),
+    /// Signatures of an OOXML document.
+    Ooxml(PackageReport),
 }
 
 impl Verification {
@@ -32,6 +38,7 @@ impl Verification {
             Verification::Pades(report) => report.is_valid(),
             Verification::Xades(report) => report.is_valid(),
             Verification::Asic(report) => report.signature.is_valid(),
+            Verification::Odf(report) | Verification::Ooxml(report) => report.is_valid(),
         }
     }
 }
@@ -57,8 +64,11 @@ pub fn verify(
         DataKind::Zip if asic::is_asic(signature) => {
             asic::verify(signature).map(Verification::Asic)
         }
+        DataKind::Odf => odf::verify(signature).map(Verification::Odf),
+        DataKind::Ooxml => ooxml::verify(signature).map(Verification::Ooxml),
         _ => Err(Error::InvalidSignature(
-            "el fichero no es una firma CAdES, XAdES, ASiC ni un PDF".to_string(),
+            "el fichero no es una firma CAdES, XAdES, ASiC, ni un PDF o documento de Office firmado"
+                .to_string(),
         )),
     }
 }

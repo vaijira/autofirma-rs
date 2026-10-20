@@ -13,6 +13,7 @@
 
 pub mod algorithm;
 pub mod asic;
+pub mod batch;
 pub mod cades;
 pub mod cert;
 pub mod digest;
@@ -21,6 +22,11 @@ pub mod facturae;
 pub mod format;
 pub mod job;
 pub mod keystore;
+pub mod massive;
+pub mod multisign;
+pub mod odf;
+pub mod ooxml;
+pub mod package;
 pub mod pades;
 pub mod params;
 pub mod policy;

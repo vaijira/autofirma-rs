@@ -55,6 +55,31 @@ impl SignatureFormat {
     }
 }
 
+impl SignatureFormat {
+    /// Name of the signed file for a file named `name`, as AutoFirma names them:
+    /// `.csig` for CAdES, `.xsig` for XAdES and FacturaE, and `_signed` before
+    /// the extension of signed PDF, ODF and OOXML documents.
+    pub fn signed_file_name(self, name: &str) -> String {
+        match self {
+            SignatureFormat::Cades => format!("{name}.csig"),
+            SignatureFormat::Xades | SignatureFormat::Facturae => format!("{name}.xsig"),
+            SignatureFormat::Pades | SignatureFormat::Odf | SignatureFormat::Ooxml => {
+                match name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) {
+                    Some((stem, extension)) => format!("{stem}_signed.{extension}"),
+                    None => format!(
+                        "{name}_signed.{}",
+                        if self == SignatureFormat::Pades {
+                            "pdf"
+                        } else {
+                            "bin"
+                        }
+                    ),
+                }
+            }
+        }
+    }
+}
+
 impl DataKind {
     /// Detects the kind of `data` from its first bytes.
     pub fn detect(data: &[u8]) -> Self {
@@ -62,12 +87,14 @@ impl DataKind {
             return DataKind::Pdf;
         }
         if data.starts_with(b"PK\x03\x04") {
-            // ODF requires an uncompressed `mimetype` entry as the first file of the package.
-            let first_entry = head(data, 128);
-            if find(first_entry, b"mimetypeapplication/vnd.oasis.opendocument").is_some() {
+            if odf_mime_type(data).is_some() {
                 return DataKind::Odf;
             }
-            if find(head(data, 64 * 1024), b"[Content_Types].xml").is_some() {
+            // Office writes `[Content_Types].xml` first, other tools anywhere:
+            // its name is also in the central directory, at the end.
+            if find(head(data, 64 * 1024), b"[Content_Types].xml").is_some()
+                || find(tail(data, 256 * 1024), b"[Content_Types].xml").is_some()
+            {
                 return DataKind::Ooxml;
             }
             return DataKind::Zip;
@@ -85,11 +112,14 @@ impl DataKind {
     }
 
     /// Signature format AutoFirma uses by default for this kind of data
-    /// (PAdES for PDF, XAdES for XML, CAdES otherwise).
+    /// (PAdES for PDF, XAdES for XML, ODF and OOXML for office documents,
+    /// CAdES otherwise).
     pub fn default_format(self) -> SignatureFormat {
         match self {
             DataKind::Pdf => SignatureFormat::Pades,
             DataKind::Xml => SignatureFormat::Xades,
+            DataKind::Odf => SignatureFormat::Odf,
+            DataKind::Ooxml => SignatureFormat::Ooxml,
             _ => SignatureFormat::Cades,
         }
     }
@@ -125,15 +155,8 @@ pub fn mime_type(data: &[u8]) -> String {
         return mime.to_string();
     }
     let kind = DataKind::detect(data);
-    if kind == DataKind::Odf {
-        // Uncompressed `mimetype` entry: its contents follow the 38 byte header and name.
-        let content = data.get(38..).unwrap_or_default();
-        let end = find(content, b"PK\x03\x04").unwrap_or(content.len().min(128));
-        if let Ok(mime) = std::str::from_utf8(&content[..end])
-            && mime.starts_with("application/vnd.oasis.opendocument")
-        {
-            return mime.to_string();
-        }
+    if let Some(mime) = odf_mime_type(data) {
+        return mime;
     }
     match kind {
         DataKind::Pdf => "application/pdf",
@@ -169,8 +192,40 @@ pub fn mime_type_oid(mime_type: &str) -> Option<&'static str> {
     })
 }
 
+/// MIME type of an ODF package (its `mimetype` part).
+fn odf_mime_type(data: &[u8]) -> Option<String> {
+    const ODF: &str = "application/vnd.oasis.opendocument";
+    let is_odf = |mime: &[u8]| {
+        std::str::from_utf8(mime)
+            .ok()
+            .map(str::trim)
+            .filter(|mime| mime.starts_with(ODF))
+            .map(str::to_string)
+    };
+    // ODF requires an uncompressed `mimetype` part first in the package: its
+    // contents follow the 30 byte header and the name.
+    if find(
+        head(data, 128),
+        b"mimetypeapplication/vnd.oasis.opendocument",
+    )
+    .is_some()
+    {
+        let content = data.get(38..).unwrap_or_default();
+        let end = find(content, b"PK\x03\x04").unwrap_or(content.len().min(128));
+        return is_odf(&content[..end]);
+    }
+    // Some tools (AutoFirma among them) compress it or move it.
+    find(tail(data, 256 * 1024), b"META-INF/manifest.xml")?;
+    let mut package = crate::package::Package::open(data).ok()?;
+    is_odf(&package.read("mimetype").ok()?)
+}
+
 fn head(data: &[u8], len: usize) -> &[u8] {
     &data[..data.len().min(len)]
+}
+
+fn tail(data: &[u8], len: usize) -> &[u8] {
+    &data[data.len().saturating_sub(len)..]
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -246,6 +301,36 @@ mod tests {
         odt.extend_from_slice(&[0; 26]);
         odt.extend_from_slice(b"mimetypeapplication/vnd.oasis.opendocument.text");
         assert_eq!(DataKind::detect(&odt), DataKind::Odf);
+        assert_eq!(DataKind::Odf.default_format(), SignatureFormat::Odf);
+        assert_eq!(DataKind::Ooxml.default_format(), SignatureFormat::Ooxml);
+    }
+
+    #[test]
+    fn signed_file_names() {
+        assert_eq!(
+            SignatureFormat::Cades.signed_file_name("a.txt"),
+            "a.txt.csig"
+        );
+        assert_eq!(
+            SignatureFormat::Facturae.signed_file_name("f.xml"),
+            "f.xml.xsig"
+        );
+        assert_eq!(
+            SignatureFormat::Pades.signed_file_name("contrato.PDF"),
+            "contrato_signed.PDF"
+        );
+        assert_eq!(
+            SignatureFormat::Pades.signed_file_name("informe"),
+            "informe_signed.pdf"
+        );
+        assert_eq!(
+            SignatureFormat::Ooxml.signed_file_name("ñ.docx"),
+            "ñ_signed.docx"
+        );
+        assert_eq!(
+            SignatureFormat::Odf.signed_file_name(".odt"),
+            ".odt_signed.bin"
+        );
     }
 
     #[test]

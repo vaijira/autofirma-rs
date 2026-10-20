@@ -19,6 +19,13 @@
 #   $AF -format xades -i doc.xml -o autofirma-enveloped-ec.xsig -store pkcs12:../certs/ec.p12 -password 1234 -alias ec -config 'format=XAdES Enveloped'
 #   $AF -format facturae -i factura.xml -o autofirma-facturae-rsa.xsig $KEY
 #
+# Co-signature of the enveloping one and counter-signature (leafs, EC) of the
+# enveloped one, with AutoFirma's XAdES signer:
+#
+#   J="java -cp /usr/lib/Autofirma/autofirma.jar ../../../tools/AfirmaMulti.java"
+#   $J ../certs/rsa.p12 cosign xades autofirma-enveloping-rsa.xsig autofirma-cosign-enveloping-rsa.xsig
+#   $J ../certs/ec.p12 countersign-leafs xades autofirma-enveloped-rsa.xsig autofirma-countersign-ec.xsig
+#
 # -config takes literal \n separators. Under the VS Code snap, run java with a clean
 # environment (env -i PATH=/usr/bin:/bin java ...).
 exit 0

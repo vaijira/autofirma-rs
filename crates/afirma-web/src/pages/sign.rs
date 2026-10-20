@@ -8,6 +8,11 @@ use afirma_core::{
     facturae::{FacturaeParams, FacturaeRole},
     format::{DataKind, SignatureFormat},
     job::{AsicSignature, FileAnalysis, Job, JobOutput, KeyEntry},
+    multisign::{
+        CounterSignTarget, MultiSignOperation, MultiSignParams, SignedKind, multisigned_file_name,
+    },
+    odf::OdfParams,
+    ooxml::OoxmlParams,
     pades::{
         CertificationLevel, Font, FontFamily, PadesParams, PdfInfo, SignaturePages,
         VisibleSignature,
@@ -101,6 +106,10 @@ struct Options {
     tsa_url: Mutable<String>,
     tsa_policy: Mutable<String>,
     pdf_timestamp: Mutable<PdfTimestamp>,
+    /// Co-signature or counter-signature of a signature; `None` signs the file.
+    operation: Mutable<Option<MultiSignOperation>>,
+    /// Signed data of an explicit CAdES signature to co-sign.
+    cosign_data: Mutable<Option<Rc<LoadedFile>>>,
 }
 
 /// "Firmar" view: pick a file, choose the options and sign it.
@@ -148,6 +157,8 @@ impl SignPage {
                 tsa_url: Mutable::new(String::new()),
                 tsa_policy: Mutable::new(String::new()),
                 pdf_timestamp: Mutable::new(PdfTimestamp::Signature),
+                operation: Mutable::new(None),
+                cosign_data: Mutable::new(None),
             },
             signature: Mutable::new(None),
             busy: Mutable::new(None),
@@ -174,10 +185,14 @@ impl SignPage {
             match this.worker.run(Job::Analyze { data: file.data.clone() }).await {
                 Ok(JobOutput::Analysis(analysis)) => {
                     let is_pdf = analysis.kind == DataKind::Pdf;
-                    this.options.format.set(match analysis.default_format {
-                        format @ (SignatureFormat::Pades | SignatureFormat::Xades | SignatureFormat::Facturae) => format,
-                        _ => SignatureFormat::Cades,
+                    this.options.format.set(analysis.default_format);
+                    // A signature is co-signed (counter-signed, for invoices) by default.
+                    this.options.operation.set(match analysis.signed {
+                        Some(SignedKind::Cades | SignedKind::Xades | SignedKind::Asic) => Some(MultiSignOperation::Cosign),
+                        Some(SignedKind::Facturae) => Some(MultiSignOperation::Countersign(CounterSignTarget::Leafs)),
+                        _ => None,
                     });
+                    this.options.cosign_data.set(None);
                     if analysis.kind != DataKind::Xml && this.options.xades_format.get() == XadesFormat::Enveloped {
                         this.options.xades_format.set(XadesFormat::Enveloping);
                     }
@@ -307,6 +322,18 @@ impl SignPage {
         }
     }
 
+    fn multisign_params(&self) -> MultiSignParams {
+        MultiSignParams {
+            digest: self.options.digest.get(),
+            mode: self.options.mode.get(),
+            policy: self.options.policy.get(),
+            signing_time: now(),
+            utc_offset_minutes: utc_offset_minutes(),
+            production_place: self.production_place(),
+            claimed_roles: Vec::new(),
+        }
+    }
+
     fn cades_params(&self, kind: DataKind) -> CadesParams {
         CadesParams {
             digest: self.options.digest.get(),
@@ -329,18 +356,21 @@ impl SignPage {
             return;
         };
         let format = this.options.format.get();
+        let operation = this.options.operation.get();
         let pdf = this.pdf.get_cloned();
 
         this.error.set(None);
         this.signature.set(None);
         this.busy.set(Some("Firmando…"));
         spawn_local(clone!(this => async move {
-            let result = match (format, &pdf) {
+            let result = if let Some(operation) = operation {
+                Self::multisign(&this, &entry, &selected, operation).await
+            } else { match (format, &pdf) {
                 (SignatureFormat::Pades, Some(pdf)) => {
                     let params = this.pades_params(pdf);
                     if this.options.triphase.get() {
                         let extra = ExtraParams::from(&params);
-                        Self::sign_triphase(&this, &entry, TriphaseFormat::Pades, &selected.file.data, params.digest, extra).await
+                        Self::sign_triphase(&this, &entry, CryptoOperation::Sign, TriphaseFormat::Pades, &selected.file.data, params.digest, extra).await
                     } else {
                         let job = Job::SignPades { data: selected.file.data.clone(), key_id: entry.id, params: Box::new(params) };
                         Self::run_signature_job(&this, job).await
@@ -348,16 +378,52 @@ impl SignPage {
                     .map(|data| SignatureResult {
                         description: format!("PDF firmado en PAdES ({}).", format_size(data.len())),
                         data,
-                        file_name: signed_pdf_name(&selected.file.name),
+                        file_name: SignatureFormat::Pades.signed_file_name(&selected.file.name),
                         mime_type: "application/pdf",
                     })
                 }
                 (SignatureFormat::Pades, None) => Err(anyhow!("Abra antes el PDF")),
+                (format @ (SignatureFormat::Odf | SignatureFormat::Ooxml), _) => {
+                    let options = &this.options;
+                    if options.triphase.get() {
+                        Err(anyhow!("Los documentos ODF y OOXML no se pueden firmar en un servidor trifásico"))
+                    } else {
+                        let job = if format == SignatureFormat::Odf {
+                            Job::SignOdf {
+                                data: selected.file.data.clone(),
+                                key_id: entry.id,
+                                params: OdfParams {
+                                    digest: options.digest.get(),
+                                    signing_time: now(),
+                                    utc_offset_minutes: utc_offset_minutes(),
+                                },
+                            }
+                        } else {
+                            Job::SignOoxml {
+                                data: selected.file.data.clone(),
+                                key_id: entry.id,
+                                params: Box::new(OoxmlParams {
+                                    digest: options.digest.get(),
+                                    utc_offset_minutes: utc_offset_minutes(),
+                                    production_place: this.production_place(),
+                                    ..OoxmlParams::new(now())
+                                }),
+                            }
+                        };
+                        Self::run_signature_job(&this, job).await
+                    }
+                    .map(|data| SignatureResult {
+                        description: format!("Documento firmado en {} ({}).", format.name(), format_size(data.len())),
+                        file_name: format.signed_file_name(&selected.file.name),
+                        mime_type: if format == SignatureFormat::Odf { "application/vnd.oasis.opendocument" } else { "application/zip" },
+                        data,
+                    })
+                }
                 (SignatureFormat::Facturae, _) => {
                     let params = this.facturae_params();
                     if this.options.triphase.get() {
                         let extra = ExtraParams::from(&params);
-                        Self::sign_triphase(&this, &entry, TriphaseFormat::Facturae, &selected.file.data, params.digest, extra).await
+                        Self::sign_triphase(&this, &entry, CryptoOperation::Sign, TriphaseFormat::Facturae, &selected.file.data, params.digest, extra).await
                     } else {
                         let job = Job::SignFacturae { data: selected.file.data.clone(), key_id: entry.id, params };
                         Self::run_signature_job(&this, job).await
@@ -365,7 +431,7 @@ impl SignPage {
                     .map(|data| SignatureResult {
                         description: format!("Factura electrónica firmada ({}).", format_size(data.len())),
                         data,
-                        file_name: format!("{}.xsig", selected.file.name),
+                        file_name: SignatureFormat::Facturae.signed_file_name(&selected.file.name),
                         mime_type: "text/xml",
                     })
                 }
@@ -401,7 +467,7 @@ impl SignPage {
                     let params = this.xades_params();
                     if this.options.triphase.get() {
                         let extra = ExtraParams::from(&params);
-                        Self::sign_triphase(&this, &entry, TriphaseFormat::Xades, &selected.file.data, params.digest, extra).await
+                        Self::sign_triphase(&this, &entry, CryptoOperation::Sign, TriphaseFormat::Xades, &selected.file.data, params.digest, extra).await
                     } else {
                         let job = Job::SignXades { data: selected.file.data.clone(), key_id: entry.id, params: Box::new(params) };
                         Self::run_signature_job(&this, job).await
@@ -409,7 +475,7 @@ impl SignPage {
                     .map(|data| SignatureResult {
                         description: format!("Firma XAdES generada ({}).", format_size(data.len())),
                         data,
-                        file_name: format!("{}.xsig", selected.file.name),
+                        file_name: SignatureFormat::Xades.signed_file_name(&selected.file.name),
                         mime_type: "text/xml",
                     })
                 }
@@ -417,7 +483,7 @@ impl SignPage {
                     let params = this.cades_params(selected.analysis.kind);
                     if this.options.triphase.get() {
                         let extra = ExtraParams::from(&params);
-                        Self::sign_triphase(&this, &entry, TriphaseFormat::Cades, &selected.file.data, params.digest, extra).await
+                        Self::sign_triphase(&this, &entry, CryptoOperation::Sign, TriphaseFormat::Cades, &selected.file.data, params.digest, extra).await
                     } else {
                         let job = Job::SignCades { data: selected.file.data.clone(), key_id: entry.id, params };
                         Self::run_signature_job(&this, job).await
@@ -425,13 +491,16 @@ impl SignPage {
                     .map(|data| SignatureResult {
                         description: format!("Firma CAdES generada ({}).", format_size(data.len())),
                         data,
-                        file_name: format!("{}.csig", selected.file.name),
+                        file_name: SignatureFormat::Cades.signed_file_name(&selected.file.name),
                         mime_type: "application/pkcs7-signature",
                     })
                 }
-            };
+            } };
+            // Counter-signatures are not timestamped.
+            let stamp = this.options.timestamp.get()
+                && !matches!(operation, Some(MultiSignOperation::Countersign(_)));
             let result = match result {
-                Ok(signature) if this.options.timestamp.get() => {
+                Ok(signature) if stamp => {
                     Self::add_timestamps(&this, signature, format, pdf.as_deref()).await
                 }
                 other => other,
@@ -543,11 +612,87 @@ impl SignPage {
         }
     }
 
+    /// Co-signature or counter-signature of the selected signature.
+    async fn multisign(
+        this: &Rc<Self>,
+        entry: &KeyEntry,
+        selected: &Selected,
+        operation: MultiSignOperation,
+    ) -> anyhow::Result<SignatureResult> {
+        let kind = selected
+            .analysis
+            .signed
+            .ok_or_else(|| anyhow!("El fichero no es una firma"))?;
+        let params = this.multisign_params();
+        let data = if this.options.triphase.get() {
+            let (format, policy_format) = match kind {
+                SignedKind::Cades => (TriphaseFormat::Cades, SignatureFormat::Cades),
+                SignedKind::Xades | SignedKind::Facturae => {
+                    (TriphaseFormat::Xades, SignatureFormat::Xades)
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Esta firma no se puede ampliar en un servidor trifásico"
+                    ));
+                }
+            };
+            let crypto_operation = match operation {
+                MultiSignOperation::Cosign => CryptoOperation::Cosign,
+                MultiSignOperation::Countersign(_) => CryptoOperation::Countersign,
+            };
+            let extra = ExtraParams::multisign(&params, operation, policy_format);
+            Self::sign_triphase(
+                this,
+                entry,
+                crypto_operation,
+                format,
+                &selected.file.data,
+                params.digest,
+                extra,
+            )
+            .await?
+        } else {
+            let job = Job::MultiSign {
+                signature: selected.file.data.clone(),
+                data: this
+                    .options
+                    .cosign_data
+                    .get_cloned()
+                    .map(|file| file.data.clone()),
+                operation,
+                key_id: entry.id,
+                params: Box::new(params),
+            };
+            Self::run_signature_job(this, job).await?
+        };
+        let (what, format) = match kind {
+            SignedKind::Cades => ("CAdES", "application/pkcs7-signature"),
+            SignedKind::Xades => ("XAdES", "text/xml"),
+            SignedKind::Facturae => ("de la factura", "text/xml"),
+            SignedKind::Asic => ("ASiC-S", "application/vnd.etsi.asic-s+zip"),
+            _ => ("", "application/octet-stream"),
+        };
+        Ok(SignatureResult {
+            description: format!(
+                "{} {what} generada ({}).",
+                match operation {
+                    MultiSignOperation::Cosign => "Cofirma",
+                    MultiSignOperation::Countersign(_) => "Contrafirma",
+                },
+                format_size(data.len())
+            ),
+            file_name: multisigned_file_name(&selected.file.name, operation),
+            mime_type: format,
+            data,
+        })
+    }
+
     /// Triphase signature: the server builds the signature, the key (in the
     /// worker) only signs the pre-signatures.
     async fn sign_triphase(
         this: &Rc<Self>,
         entry: &KeyEntry,
+        operation: CryptoOperation,
         format: TriphaseFormat,
         document: &[u8],
         digest: DigestAlgorithm,
@@ -565,7 +710,7 @@ impl SignPage {
             .ok_or_else(|| anyhow!("Tipo de clave no soportado"))?;
         let request = TriphaseRequest {
             format,
-            operation: CryptoOperation::Sign,
+            operation,
             digest,
             key_type,
             chain: entry.chain.iter().map(|c| c.to_vec()).collect(),
@@ -696,7 +841,18 @@ impl SignPage {
     fn render_sign_form(this: &Rc<Self>, selected: &Rc<Selected>) -> Dom {
         let is_pdf = selected.analysis.kind == DataKind::Pdf;
         let is_xml = selected.analysis.kind == DataKind::Xml;
+        let signed = selected.analysis.signed;
         let formats: &[(&str, &str)] = match selected.analysis.default_format {
+            SignatureFormat::Odf => &[
+                ("odf", "ODF (firma dentro del documento)"),
+                ("cades", "CAdES"),
+                ("xades", "XAdES"),
+            ],
+            SignatureFormat::Ooxml => &[
+                ("ooxml", "OOXML (firma dentro del documento)"),
+                ("cades", "CAdES"),
+                ("xades", "XAdES"),
+            ],
             SignatureFormat::Pades => &[
                 ("pades", "PAdES (firma dentro del PDF)"),
                 ("cades", "CAdES"),
@@ -712,27 +868,61 @@ impl SignPage {
         };
         let options = &this.options;
 
+        let note = match signed {
+            Some(SignedKind::Odf | SignedKind::Ooxml) => Some(
+                "El documento ya está firmado; se añadirá otra firma sin invalidar las anteriores.",
+            ),
+            Some(SignedKind::Cades | SignedKind::Xades | SignedKind::Asic) => Some(
+                "El fichero es una firma: puede cofirmarla (otro firmante firma los mismos datos), \
+                 contrafirmarla (firmar las firmas existentes) o firmarlo como un fichero cualquiera.",
+            ),
+            Some(SignedKind::Facturae) => Some(
+                "La factura ya está firmada: puede contrafirmarla o firmarla como un fichero cualquiera.",
+            ),
+            _ => None,
+        };
+        let multisign = matches!(
+            signed,
+            Some(SignedKind::Cades | SignedKind::Xades | SignedKind::Facturae | SignedKind::Asic)
+        );
+
         html!("div", {
+            .apply_if(note.is_some(), |dom| dom.child(html!("p", {
+                .attr("id", "sign_note")
+                .text(note.unwrap_or_default())
+            })))
             .child(html!("div", {
                 .class(&*OPTIONS_CLASS)
+                .apply_if(multisign, |dom| dom.child(Self::render_operation(this, signed)))
+                .child_signal(options.operation.signal().map(clone!(this => move |operation| {
+                    operation.is_none().then(|| html!("div", {
+                        .style("display", "contents")
+                        .children(&mut [
+                            html!("label", { .attr("for", "sign_format").text("Formato") }),
+                            select(
+                                "sign_format",
+                                formats,
+                                match this.options.format.get() {
+                                    SignatureFormat::Pades => "pades",
+                                    SignatureFormat::Xades => "xades",
+                                    SignatureFormat::Facturae => "facturae",
+                                    SignatureFormat::Odf => "odf",
+                                    SignatureFormat::Ooxml => "ooxml",
+                                    SignatureFormat::Cades => "cades",
+                                },
+                                clone!(this => move |value| this.options.format.set(match value.as_str() {
+                                    "pades" => SignatureFormat::Pades,
+                                    "xades" => SignatureFormat::Xades,
+                                    "facturae" => SignatureFormat::Facturae,
+                                    "odf" => SignatureFormat::Odf,
+                                    "ooxml" => SignatureFormat::Ooxml,
+                                    _ => SignatureFormat::Cades,
+                                })),
+                            ),
+                        ])
+                    }))
+                })))
                 .children(&mut [
-                    html!("label", { .attr("for", "sign_format").text("Formato") }),
-                    select(
-                        "sign_format",
-                        formats,
-                        match options.format.get() {
-                            SignatureFormat::Pades => "pades",
-                            SignatureFormat::Xades => "xades",
-                            SignatureFormat::Facturae => "facturae",
-                            _ => "cades",
-                        },
-                        clone!(this => move |value| this.options.format.set(match value.as_str() {
-                            "pades" => SignatureFormat::Pades,
-                            "xades" => SignatureFormat::Xades,
-                            "facturae" => SignatureFormat::Facturae,
-                            _ => SignatureFormat::Cades,
-                        })),
-                    ),
                     html!("label", { .attr("for", "sign_digest").text("Algoritmo") }),
                     select(
                         "sign_digest",
@@ -749,14 +939,22 @@ impl SignPage {
                         })),
                     ),
                 ])
-                // FacturaE has its own policy.
-                .child_signal(options.format.signal().map(clone!(this => move |format| {
-                    (format != SignatureFormat::Facturae).then(|| Self::render_policy(&this))
-                })))
-                .child_signal(options.format.signal().map(clone!(this => move |format| match format {
-                    SignatureFormat::Cades => Some(Self::render_cades_options(&this)),
-                    SignatureFormat::Xades => Some(Self::render_xades_options(&this, is_xml)),
-                    SignatureFormat::Facturae => Some(Self::render_facturae_options(&this)),
+                // FacturaE has its own policy; ODF and OOXML none.
+                .child_signal(map_ref! {
+                    let format = options.format.signal(),
+                    let operation = options.operation.signal() => move {
+                        operation.is_some()
+                            || !matches!(format, SignatureFormat::Facturae | SignatureFormat::Odf | SignatureFormat::Ooxml)
+                    }
+                }.map(clone!(this => move |policy| policy.then(|| Self::render_policy(&this)))))
+                .child_signal(map_ref! {
+                    let format = options.format.signal(),
+                    let operation = options.operation.signal() => (*format, *operation)
+                }.map(clone!(this => move |(format, operation)| match (operation, format) {
+                    (Some(operation), _) => Some(Self::render_multisign_options(&this, signed, operation)),
+                    (None, SignatureFormat::Cades) => Some(Self::render_cades_options(&this)),
+                    (None, SignatureFormat::Xades) => Some(Self::render_xades_options(&this, is_xml)),
+                    (None, SignatureFormat::Facturae) => Some(Self::render_facturae_options(&this)),
                     _ => None,
                 })))
                 .children(&mut [
@@ -779,15 +977,26 @@ impl SignPage {
                 let page = this.clone();
                 map_ref! {
                     let pades = options.format.signal().map(|f| f == SignatureFormat::Pades),
+                    let operation = options.operation.signal(),
                     let pdf = this.pdf.signal_cloned() => move {
-                        match (pades, pdf) {
-                            (true, Some(pdf)) => Some(Self::render_pades_options(&page, pdf)),
+                        match (pades, operation, pdf) {
+                            (true, None, Some(pdf)) => Some(Self::render_pades_options(&page, pdf)),
                             _ => None,
                         }
                     }
                 }
             })
-            .child(Self::render_timestamp_options(this, is_pdf))
+            // Counter-signatures are not timestamped; ODF and OOXML have no timestamps.
+            .child_signal(map_ref! {
+                let format = options.format.signal(),
+                let operation = options.operation.signal() => {
+                    match operation {
+                        Some(MultiSignOperation::Countersign(_)) => false,
+                        Some(MultiSignOperation::Cosign) => true,
+                        None => !matches!(format, SignatureFormat::Odf | SignatureFormat::Ooxml),
+                    }
+                }
+            }.map(clone!(this => move |stamp| stamp.then(|| Self::render_timestamp_options(&this, is_pdf)))))
             .child(Self::render_triphase_options(this))
             .child(html!("button", {
                 .attr("type", "button")
@@ -797,13 +1006,108 @@ impl SignPage {
                     let key = this.keys.selected.signal(),
                     let busy = this.busy.signal(),
                     let format = options.format.signal(),
+                    let operation = options.operation.signal(),
                     let pdf = this.pdf.signal_ref(Option::is_some) => {
-                        let missing_pdf = *format == SignatureFormat::Pades && !pdf;
+                        let missing_pdf = operation.is_none() && *format == SignatureFormat::Pades && !pdf;
                         (key.is_none() || busy.is_some() || missing_pdf).then_some("")
                     }
                 })
                 .event(clone!(this => move |_: events::Click| Self::sign(&this)))
             }))
+        })
+    }
+
+    /// What to do with a signature: co-sign, counter-sign or sign it as data.
+    fn render_operation(this: &Rc<Self>, signed: Option<SignedKind>) -> Dom {
+        let mut operations = Vec::new();
+        if signed != Some(SignedKind::Facturae) {
+            operations.push(("cosign", "Cofirmar (otro firmante firma los mismos datos)"));
+        }
+        operations.extend([
+            ("leafs", "Contrafirmar las últimas firmas"),
+            ("tree", "Contrafirmar todas las firmas"),
+            ("sign", "Firmar el fichero como datos (nueva firma)"),
+        ]);
+        html!("div", {
+            .style("display", "contents")
+            .children(&mut [
+                html!("label", { .attr("for", "sign_operation").text("Operación") }),
+                select(
+                    "sign_operation",
+                    &operations,
+                    match this.options.operation.get() {
+                        Some(MultiSignOperation::Cosign) => "cosign",
+                        Some(MultiSignOperation::Countersign(CounterSignTarget::Leafs)) => "leafs",
+                        Some(MultiSignOperation::Countersign(CounterSignTarget::Tree)) => "tree",
+                        None => "sign",
+                    },
+                    clone!(this => move |value| this.options.operation.set(match value.as_str() {
+                        "cosign" => Some(MultiSignOperation::Cosign),
+                        "leafs" => Some(MultiSignOperation::Countersign(CounterSignTarget::Leafs)),
+                        "tree" => Some(MultiSignOperation::Countersign(CounterSignTarget::Tree)),
+                        _ => None,
+                    })),
+                ),
+            ])
+        })
+    }
+
+    /// Options of a co-signature or counter-signature.
+    fn render_multisign_options(
+        this: &Rc<Self>,
+        signed: Option<SignedKind>,
+        operation: MultiSignOperation,
+    ) -> Dom {
+        let xml = matches!(
+            signed,
+            Some(SignedKind::Xades | SignedKind::Facturae | SignedKind::Asic)
+        );
+        let cades_cosign =
+            signed == Some(SignedKind::Cades) && operation == MultiSignOperation::Cosign;
+        let data_picker = FilePicker::new(
+            "sign_cosign_data",
+            "Seleccionar los datos firmados",
+            "*/*",
+            clone!(this => move |result| match result {
+                Ok(file) => this.options.cosign_data.set(Some(Rc::new(file))),
+                Err(err) => this.error.set(Some(err)),
+            }),
+        );
+        html!("div", {
+            .style("display", "contents")
+            .apply_if(xml, |dom| dom.children(&mut [
+                html!("label", { .attr("for", "sign_city").text("Lugar") }),
+                text_input("sign_city", &this.options.location),
+            ]))
+            .apply_if(cades_cosign, |dom| dom.children(&mut [
+                html!("span", { .text("Datos firmados") }),
+                html!("div", {
+                    .children(&mut [
+                        html!("small", {
+                            .style("color", "var(--muted)")
+                            .text("Solo hacen falta si la firma no incluye los datos y se usa otro algoritmo.")
+                        }),
+                    ])
+                    .child(html!("div", {
+                        .style("display", "flex")
+                        .style("gap", "0.5rem")
+                        .style("align-items", "center")
+                        .child(FilePicker::render(&data_picker))
+                        .child_signal(this.options.cosign_data.signal_cloned().map(clone!(this => move |data| {
+                            data.map(|file| html!("span", {
+                                .children(&mut [
+                                    html!("span", { .attr("id", "sign_cosign_data_name").text(&file.name) }),
+                                    html!("button", {
+                                        .attr("type", "button")
+                                        .text("Quitar")
+                                        .event(clone!(this => move |_: events::Click| this.options.cosign_data.set(None)))
+                                    }),
+                                ])
+                            }))
+                        })))
+                    }))
+                }),
+            ]))
         })
     }
 
@@ -1187,19 +1491,7 @@ fn content_description(kind: DataKind) -> Option<String> {
     }
 }
 
-/// `documento.pdf` → `documento_signed.pdf`, as AutoFirma names signed PDFs.
-fn signed_pdf_name(name: &str) -> String {
-    let stem = name.len().checked_sub(4).filter(|&i| {
-        name.get(i..)
-            .is_some_and(|extension| extension.eq_ignore_ascii_case(".pdf"))
-    });
-    match stem {
-        Some(stem) => format!("{}_signed.pdf", &name[..stem]),
-        None => format!("{name}_signed.pdf"),
-    }
-}
-
-fn select(
+pub(crate) fn select(
     id: &str,
     options: &[(&str, &str)],
     current: &str,
@@ -1220,7 +1512,7 @@ fn select(
     })
 }
 
-fn text_input(id: &str, value: &Mutable<String>) -> Dom {
+pub(crate) fn text_input(id: &str, value: &Mutable<String>) -> Dom {
     html!("input" => HtmlInputElement, {
         .attr("type", "text")
         .attr("id", id)
@@ -1231,7 +1523,7 @@ fn text_input(id: &str, value: &Mutable<String>) -> Dom {
     })
 }
 
-fn checkbox(id: &str, label: &str, value: &Mutable<bool>) -> Dom {
+pub(crate) fn checkbox(id: &str, label: &str, value: &Mutable<bool>) -> Dom {
     html!("label", {
         .style("display", "flex")
         .style("gap", "0.4rem")
@@ -1248,16 +1540,4 @@ fn checkbox(id: &str, label: &str, value: &Mutable<bool>) -> Dom {
             html!("span", { .text(label) }),
         ])
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signed_pdf_names() {
-        assert_eq!(signed_pdf_name("contrato.PDF"), "contrato_signed.pdf");
-        assert_eq!(signed_pdf_name("informe"), "informe_signed.pdf");
-        assert_eq!(signed_pdf_name("ñ.pdf"), "ñ_signed.pdf");
-    }
 }

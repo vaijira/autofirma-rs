@@ -81,3 +81,76 @@ impl FilePicker {
         })
     }
 }
+
+/// Button that lets the user pick several local files and reads them into memory.
+pub struct MultiFilePicker {
+    id: &'static str,
+    label: &'static str,
+    on_load: Box<dyn Fn(Result<Vec<LoadedFile>, String>)>,
+}
+
+impl std::fmt::Debug for MultiFilePicker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiFilePicker")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl MultiFilePicker {
+    pub fn new(
+        id: &'static str,
+        label: &'static str,
+        on_load: impl Fn(Result<Vec<LoadedFile>, String>) + 'static,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            id,
+            label,
+            on_load: Box::new(on_load),
+        })
+    }
+
+    pub fn render(this: &Rc<Self>) -> Dom {
+        html!("div", {
+            .children(&mut [
+                html!("button", {
+                    .attr("type", "button")
+                    .child(html!("label", {
+                        .attr("for", this.id)
+                        .text(this.label)
+                    }))
+                }),
+                html!("input" => HtmlInputElement, {
+                    .class(&*HIDDEN_INPUT_CLASS)
+                    .attr("id", this.id)
+                    .attr("type", "file")
+                    .attr("multiple", "")
+                    .with_node!(element => {
+                        .event(clone!(this => move |_: events::Change| {
+                            let Some(list) = element.files() else {
+                                return;
+                            };
+                            let files: Vec<web_sys::File> = (0..list.length()).filter_map(|i| list.get(i)).collect();
+                            spawn_local(clone!(this => async move {
+                                let mut loaded = Vec::with_capacity(files.len());
+                                for file in files {
+                                    let name = file.name();
+                                    match read_as_bytes(&Blob::from(file)).await {
+                                        Ok(data) => loaded.push(LoadedFile { name, data }),
+                                        Err(e) => {
+                                            (this.on_load)(Err(format!("No se pudo leer {name}: {e}")));
+                                            return;
+                                        }
+                                    }
+                                }
+                                (this.on_load)(Ok(loaded));
+                            }));
+                            // Allow picking the same files again.
+                            element.set_value("");
+                        }))
+                    })
+                }),
+            ])
+        })
+    }
+}

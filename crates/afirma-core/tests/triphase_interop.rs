@@ -17,17 +17,21 @@ use std::{
 };
 
 use afirma_core::{
+    cades::{self, CadesParams, SignatureMode},
     digest::DigestAlgorithm,
     facturae::FacturaeParams,
+    format::SignatureFormat,
     keystore::{SigningKey, load_pkcs12},
+    multisign::{CounterSignTarget, MultiSignOperation, MultiSignParams},
     pades::{Font, PadesParams, Rect, SignaturePages, VisibleSignature},
     params::ExtraParams,
+    policy::PolicyPreset,
     triphase::{
         self, CryptoOperation, TriphaseFormat, TriphaseRequest, parse_postsign_response,
         parse_presign_response,
     },
     validation::{self, Verification},
-    xades::{ProductionPlace, XadesFormat, XadesParams},
+    xades::{self, ProductionPlace, XadesFormat, XadesParams},
 };
 
 fn repo() -> PathBuf {
@@ -88,9 +92,19 @@ fn triphase_sign(
     document: &[u8],
     params: ExtraParams,
 ) -> Vec<u8> {
+    triphase(key, CryptoOperation::Sign, format, document, params)
+}
+
+fn triphase(
+    key: &dyn SigningKey,
+    operation: CryptoOperation,
+    format: TriphaseFormat,
+    document: &[u8],
+    params: ExtraParams,
+) -> Vec<u8> {
     let request = TriphaseRequest {
         format,
-        operation: CryptoOperation::Sign,
+        operation,
         digest: DigestAlgorithm::Sha512,
         key_type: key.key_type(),
         chain: key
@@ -195,5 +209,87 @@ fn signs_with_the_autofirma_triphase_server() {
         );
         let verification = validation::verify(&signature, None, None).unwrap();
         assert!(verification.is_valid(), "{keystore}: {verification:?}");
+    }
+}
+
+fn policy_format(format: TriphaseFormat) -> SignatureFormat {
+    match format {
+        TriphaseFormat::Cades => SignatureFormat::Cades,
+        _ => SignatureFormat::Xades,
+    }
+}
+
+#[test]
+#[ignore]
+fn cosigns_and_countersigns_with_the_autofirma_triphase_server() {
+    let p12 = |name: &str| {
+        let p12 = std::fs::read(repo().join("tests/data/certs").join(name)).unwrap();
+        load_pkcs12(&p12, "1234").unwrap().remove(0)
+    };
+    let (rsa, ec) = (p12("rsa.p12"), p12("ec.p12"));
+    let xml = std::fs::read(repo().join("tests/data/xades/doc.xml")).unwrap();
+    let multi = MultiSignParams {
+        policy: Some(PolicyPreset::Age19),
+        ..MultiSignParams::new(0)
+    };
+    let tree = MultiSignOperation::Countersign(CounterSignTarget::Tree);
+
+    // CAdES, implicit: signed here, co-signed and counter-signed by the server.
+    let signature = cades::sign(
+        b"Hola triphase\n",
+        &rsa,
+        &CadesParams {
+            digest: DigestAlgorithm::Sha512,
+            mode: SignatureMode::Implicit,
+            policy: None,
+            signing_time: 1_792_428_983,
+            content_description: None,
+        },
+    )
+    .unwrap();
+    let mut documents = vec![(TriphaseFormat::Cades, signature)];
+    for format in [XadesFormat::Enveloping, XadesFormat::Enveloped] {
+        let signature = xades::sign(
+            &xml,
+            &rsa,
+            &XadesParams {
+                format,
+                ..XadesParams::new(1_792_428_983)
+            },
+        )
+        .unwrap();
+        documents.push((TriphaseFormat::Xades, signature));
+    }
+    for (format, signature) in documents {
+        let cosigned = triphase(
+            &ec,
+            CryptoOperation::Cosign,
+            format,
+            &signature,
+            ExtraParams::multisign(&multi, MultiSignOperation::Cosign, policy_format(format)),
+        );
+        let verification = validation::verify(&cosigned, None, None).unwrap();
+        assert!(
+            verification.is_valid(),
+            "{format:?} cosign: {verification:?}"
+        );
+        let countersigned = triphase(
+            &rsa,
+            CryptoOperation::Countersign,
+            format,
+            &cosigned,
+            ExtraParams::multisign(&multi, tree, policy_format(format)),
+        );
+        let verification = validation::verify(&countersigned, None, None).unwrap();
+        assert!(
+            verification.is_valid(),
+            "{format:?} countersign: {verification:?}"
+        );
+        let signers = match verification {
+            Verification::Cades(report) => report.signers.len(),
+            Verification::Xades(report) => report.signatures.len(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(signers, 4, "{format:?}");
     }
 }

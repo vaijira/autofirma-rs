@@ -86,6 +86,15 @@ pub enum Error {
     /// The ASiC container could not be read.
     #[error("el contenedor ASiC no es válido: {0}")]
     InvalidAsic(String),
+    /// The signature has long-term (archive) attributes that a new signature would invalidate.
+    #[error("la firma tiene sellos de archivo (firma longeva) y no admite más firmas")]
+    LongTermSignature,
+    /// The ODF or OOXML document could not be read.
+    #[error("el documento no es válido: {0}")]
+    InvalidPackage(String),
+    /// The JSON signature batch could not be processed.
+    #[error("lote de firma: {0}")]
+    Batch(String),
     /// No random values available.
     #[error("no se pudieron generar valores aleatorios: {0}")]
     Random(String),

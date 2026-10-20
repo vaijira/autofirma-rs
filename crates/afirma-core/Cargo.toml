@@ -12,6 +12,8 @@ rust-version.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
+# JSON batches of AutoFirma's batch signing service.
+serde_json = "1"
 thiserror.workspace = true
 
 # RustCrypto, der 0.8 / x509-cert 0.3 generation (the same one p12-keystore uses).

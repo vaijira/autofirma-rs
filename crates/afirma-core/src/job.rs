@@ -14,6 +14,7 @@ use zeroize::Zeroize;
 
 use crate::{
     asic,
+    batch::{self, BatchResult, BatchStep},
     cades::{self, CadesParams},
     cert::CertificateInfo,
     digest::{DigestAlgorithm, to_hex},
@@ -21,6 +22,10 @@ use crate::{
     facturae::{self, FacturaeParams},
     format::{DataKind, SignatureFormat},
     keystore::{SigningKey, SoftKey, load_pkcs12},
+    massive::{self, MassiveFile, MassiveParams, MassiveResult},
+    multisign::{self, MultiSignOperation, MultiSignParams, SignedKind},
+    odf::{self, OdfParams},
+    ooxml::{self, OoxmlParams},
     pades::{self, PadesParams, PdfInfo},
     triphase::{self, TriphaseData},
     tsp,
@@ -152,6 +157,75 @@ pub enum Job {
         /// Signature inside the container.
         params: Box<AsicSignature>,
     },
+    /// Sign an ODF document (or add a signature to a signed one).
+    SignOdf {
+        /// The document.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+        /// Signature parameters.
+        params: OdfParams,
+    },
+    /// Sign an OOXML document (or add a signature to a signed one).
+    SignOoxml {
+        /// The document.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+        /// Signature parameters.
+        params: Box<OoxmlParams>,
+    },
+    /// Co-sign or counter-sign a signature, keeping its format.
+    MultiSign {
+        /// The signature or signed document.
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+        /// The signed data, for explicit CAdES signatures that need it.
+        #[serde(with = "serde_bytes", default)]
+        data: Option<Vec<u8>>,
+        /// Co-signature or counter-signature.
+        operation: MultiSignOperation,
+        /// Key id.
+        key_id: u32,
+        /// Signature parameters.
+        params: Box<MultiSignParams>,
+    },
+    /// Sign many files into a ZIP file.
+    SignMassive {
+        /// The files.
+        files: Vec<MassiveFile>,
+        /// Key id.
+        key_id: u32,
+        /// Options for every file.
+        params: Box<MassiveParams>,
+    },
+    /// Read a JSON batch (as is or in Base64) and build its presign request.
+    BatchPresign {
+        /// The batch.
+        #[serde(with = "serde_bytes")]
+        batch: Vec<u8>,
+        /// Key id (its certificate chain goes in the request).
+        key_id: u32,
+    },
+    /// Sign the pre-signatures of a JSON batch and build the postsign request.
+    SignBatch {
+        /// The batch (JSON).
+        #[serde(with = "serde_bytes")]
+        batch: Vec<u8>,
+        /// Body of the response of the presign service.
+        #[serde(with = "serde_bytes")]
+        presign_response: Vec<u8>,
+        /// Key id.
+        key_id: u32,
+    },
+    /// Read the response of the postsign service of a batch.
+    BatchResults {
+        /// Body of the response.
+        #[serde(with = "serde_bytes")]
+        response: Vec<u8>,
+    },
     /// Build the timestamp requests for the signature timestamps of a signature
     /// (CAdES, XAdES, PDF or ASiC-S): one request body per signature to timestamp.
     TimestampRequests {
@@ -223,6 +297,13 @@ impl std::fmt::Debug for Job {
             Job::SignXades { .. } => "SignXades",
             Job::SignFacturae { .. } => "SignFacturae",
             Job::SignAsic { .. } => "SignAsic",
+            Job::SignOdf { .. } => "SignOdf",
+            Job::SignOoxml { .. } => "SignOoxml",
+            Job::MultiSign { .. } => "MultiSign",
+            Job::SignMassive { .. } => "SignMassive",
+            Job::BatchPresign { .. } => "BatchPresign",
+            Job::SignBatch { .. } => "SignBatch",
+            Job::BatchResults { .. } => "BatchResults",
             Job::TimestampRequests { .. } => "TimestampRequests",
             Job::AddTimestamps { .. } => "AddTimestamps",
             Job::PrepareDocumentTimestamp { .. } => "PrepareDocumentTimestamp",
@@ -250,6 +331,20 @@ pub enum JobOutput {
     Triphase(TriphaseData),
     /// Output of [`Job::Verify`].
     Verification(Verification),
+    /// Output of [`Job::SignMassive`].
+    Massive(MassiveResult),
+    /// Output of [`Job::BatchPresign`].
+    BatchPresign {
+        /// The batch, decoded (JSON).
+        #[serde(with = "serde_bytes")]
+        batch: Vec<u8>,
+        /// Body of the presign request.
+        body: String,
+    },
+    /// Output of [`Job::SignBatch`].
+    Batch(BatchStep),
+    /// Output of [`Job::BatchResults`].
+    BatchResults(Vec<BatchResult>),
     /// Output of [`Job::TimestampRequests`]: the request bodies.
     TimestampRequests(Vec<serde_bytes::ByteBuf>),
     /// Output of [`Job::PrepareDocumentTimestamp`].
@@ -283,6 +378,9 @@ pub struct FileAnalysis {
     pub default_format: SignatureFormat,
     /// SHA-256 digest, hex encoded.
     pub sha256: String,
+    /// Kind of signature, if the file is a signature or a signed document.
+    #[serde(default)]
+    pub signed: Option<SignedKind>,
 }
 
 /// A private key loaded in the worker.
@@ -414,6 +512,66 @@ impl Engine {
                 }
                 .map(JobOutput::Signature)
             }
+            Job::SignOdf {
+                data,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                odf::sign(&data, key, &params).map(JobOutput::Signature)
+            }
+            Job::SignOoxml {
+                data,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                ooxml::sign(&data, key, &params).map(JobOutput::Signature)
+            }
+            Job::MultiSign {
+                signature,
+                data,
+                operation,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                multisign::multisign(&signature, data.as_deref(), operation, key, &params)
+                    .map(JobOutput::Signature)
+            }
+            Job::SignMassive {
+                files,
+                key_id,
+                params,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                massive::sign_all(&files, key, &params).map(JobOutput::Massive)
+            }
+            Job::BatchPresign { batch, key_id } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                let batch = batch::decode_batch(&batch)?;
+                batch::digest(&batch)?;
+                let chain = key
+                    .certificate_chain()
+                    .iter()
+                    .map(crate::cert::to_der)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(JobOutput::BatchPresign {
+                    body: batch::presign_body(&batch, &chain),
+                    batch,
+                })
+            }
+            Job::SignBatch {
+                batch,
+                presign_response,
+                key_id,
+            } => {
+                let key = self.keys.get(&key_id).ok_or(Error::KeyNotFound)?;
+                batch::sign_presigned(&batch, &presign_response, key).map(JobOutput::Batch)
+            }
+            Job::BatchResults { response } => {
+                batch::parse_postsign_response(&response).map(JobOutput::BatchResults)
+            }
             Job::TimestampRequests {
                 signed,
                 digest,
@@ -489,6 +647,7 @@ fn analyze(data: &[u8]) -> Result<FileAnalysis> {
         kind,
         default_format,
         sha256: to_hex(&DigestAlgorithm::Sha256.digest(data)),
+        signed: SignedKind::detect(data),
     })
 }
 
@@ -651,6 +810,7 @@ mod tests {
             panic!("not analyzed");
         };
         assert_eq!(analysis.default_format, SignatureFormat::Facturae);
+        assert_eq!(analysis.signed, None);
 
         let time = 1_792_428_983;
         let signatures = [
@@ -704,5 +864,54 @@ mod tests {
             };
             assert!(verification.is_valid(), "{verification:?}");
         }
+    }
+
+    #[test]
+    fn multisign_and_massive_jobs() {
+        let read = |path: &str| {
+            std::fs::read(format!(
+                "{}/../../tests/data/{path}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        let mut engine = Engine::new();
+        let Ok(JobOutput::Keys(keys)) = engine.run(Job::LoadPkcs12 {
+            data: read("certs/ec.p12"),
+            password: "1234".to_string(),
+        }) else {
+            panic!("keystore not loaded");
+        };
+        let key_id = keys[0].id;
+
+        let signature = read("cades/autofirma-implicit-age-rsa.csig");
+        let Ok(JobOutput::Analysis(analysis)) = engine.run(Job::Analyze {
+            data: signature.clone(),
+        }) else {
+            panic!("not analyzed");
+        };
+        assert_eq!(analysis.signed, Some(SignedKind::Cades));
+        let Ok(JobOutput::Signature(cosigned)) = engine.run(Job::MultiSign {
+            signature,
+            data: None,
+            operation: MultiSignOperation::Cosign,
+            key_id,
+            params: Box::new(MultiSignParams::new(1_792_428_983)),
+        }) else {
+            panic!("not cosigned");
+        };
+        assert!(cades::verify(&cosigned, None).unwrap().is_valid());
+
+        let Ok(JobOutput::Massive(result)) = engine.run(Job::SignMassive {
+            files: vec![MassiveFile {
+                name: "doc.txt".to_string(),
+                data: read("xades/doc.txt"),
+            }],
+            key_id,
+            params: Box::new(MassiveParams::new(1_792_428_983)),
+        }) else {
+            panic!("not signed");
+        };
+        assert_eq!(result.signed(), 1);
     }
 }

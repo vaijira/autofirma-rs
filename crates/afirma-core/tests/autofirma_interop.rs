@@ -1,10 +1,12 @@
 //! Cross-validation of autofirma-rs signatures with AutoFirma's own validators
 //! (`tools/AfirmaValidate.java`), `openssl cms -verify` (CAdES), poppler's
-//! `pdfsig` and `qpdf --check` (PAdES). Timestamps come from `openssl ts -reply`
-//! acting as the TSA.
+//! `pdfsig` and `qpdf --check` (PAdES), the JDK's XMLDSig (ODF, OOXML) and
+//! LibreOffice (`tools/lo_verify.py`, ODF). Timestamps come from
+//! `openssl ts -reply` acting as the TSA. AutoFirma's own signers co-sign and
+//! counter-sign our signatures (`tools/AfirmaMulti.java`).
 //!
-//! Needs Java, OpenSSL, poppler-utils, qpdf and AutoFirma installed, so it is
-//! ignored by default:
+//! Needs Java, OpenSSL, poppler-utils, qpdf, LibreOffice (with python3-uno)
+//! and AutoFirma installed, so it is ignored by default:
 //!
 //! ```sh
 //! cargo test -p afirma-core --test autofirma_interop -- --ignored
@@ -20,6 +22,9 @@ use afirma_core::{
     digest::DigestAlgorithm,
     format::SignatureFormat,
     keystore::load_pkcs12,
+    multisign::CounterSignTarget,
+    odf::{self, OdfParams},
+    ooxml::{self, OoxmlParams},
     pades::{self, CertificationLevel, Font, PadesParams, Rect, SignaturePages, VisibleSignature},
     policy::PolicyPreset,
     tsp, validation,
@@ -543,6 +548,230 @@ fn autofirma_and_the_jdk_accept_our_asic_containers() {
                 }
             }
         }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `java -cp autofirma.jar tools/<tool> args...`
+fn java(tool: &str) -> Command {
+    let mut java = Command::new("java");
+    java.arg("-cp")
+        .arg(autofirma_jar())
+        .arg(repo().join("tools").join(tool));
+    java
+}
+
+#[test]
+#[ignore]
+fn autofirma_accepts_our_cosignatures_and_countersignatures() {
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("autofirma_interop_multi");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let data_path = out_dir.join("doc.txt");
+    std::fs::write(&data_path, DATA).unwrap();
+    let xml = std::fs::read(repo().join("tests/data/xades/doc.xml")).unwrap();
+    let p12 = |name: &str| {
+        let p12 = std::fs::read(repo().join("tests/data/certs").join(name)).unwrap();
+        load_pkcs12(&p12, "1234").unwrap().remove(0)
+    };
+    let (rsa, ec) = (p12("rsa.p12"), p12("ec.p12"));
+    let cades_params = |mode| CadesParams {
+        digest: DigestAlgorithm::Sha512,
+        mode,
+        policy: Some(PolicyPreset::Age19.policy(SignatureFormat::Cades)),
+        signing_time: now(),
+        content_description: Some("Texto plano".to_string()),
+    };
+    let xades_params = |format| XadesParams {
+        format,
+        utc_offset_minutes: 120,
+        ..XadesParams::new(now())
+    };
+
+    // Signed by RSA, co-signed by EC, then every signature counter-signed by RSA.
+    let mut files: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    for mode in [SignatureMode::Explicit, SignatureMode::Implicit] {
+        let signed = cades::sign(DATA, &rsa, &cades_params(mode)).unwrap();
+        let cosigned = cades::cosign(&signed, None, &ec, &cades_params(mode)).unwrap();
+        let tree = cades::countersign(
+            &cosigned,
+            CounterSignTarget::Tree,
+            &rsa,
+            &cades_params(mode),
+        )
+        .unwrap();
+        let explicit = mode == SignatureMode::Explicit;
+        files.push((format!("cades-{mode:?}-cosign.csig"), cosigned, explicit));
+        files.push((format!("cades-{mode:?}-countersign.csig"), tree, explicit));
+    }
+    for format in [
+        XadesFormat::Enveloping,
+        XadesFormat::Enveloped,
+        XadesFormat::Detached,
+    ] {
+        let signed = xades::sign(&xml, &rsa, &xades_params(format)).unwrap();
+        let cosigned = xades::cosign(&signed, None, &ec, &xades_params(format)).unwrap();
+        let tree = xades::countersign(
+            &cosigned,
+            CounterSignTarget::Tree,
+            &rsa,
+            &xades_params(format),
+        )
+        .unwrap();
+        files.push((format!("xades-{format:?}-cosign.xsig"), cosigned, false));
+        files.push((format!("xades-{format:?}-countersign.xsig"), tree, false));
+    }
+
+    let mut failures = Vec::new();
+    for (name, signature, explicit) in &files {
+        let path = out_dir.join(name);
+        std::fs::write(&path, signature).unwrap();
+        let data = explicit.then_some(DATA);
+        let verification = validation::verify(signature, data, None).unwrap();
+        if !verification.is_valid() {
+            failures.push(format!("we reject {name}: {verification:?}"));
+        }
+        let mut validate = java("AfirmaValidate.java");
+        validate.arg(&path);
+        if *explicit {
+            validate.arg(&data_path);
+        }
+        let (ok, output) = run(&mut validate);
+        if !ok {
+            failures.push(format!("AutoFirma rejected {name}:\n{output}"));
+        }
+        if name.starts_with("cades") {
+            // OpenSSL checks every signer (not the counter-signatures).
+            let mut openssl = Command::new("openssl");
+            openssl
+                .args(["cms", "-verify", "-binary", "-noverify", "-inform", "DER"])
+                .arg("-in")
+                .arg(&path)
+                .arg("-out")
+                .arg(out_dir.join("openssl.out"));
+            if *explicit {
+                openssl.arg("-content").arg(&data_path);
+            }
+            let (ok, output) = run(&mut openssl);
+            if !ok {
+                failures.push(format!("OpenSSL rejected {name}:\n{output}"));
+            }
+        }
+
+        // AutoFirma adds its own signatures to ours, and we verify them.
+        let format = if name.starts_with("cades") {
+            "cades"
+        } else {
+            "xades"
+        };
+        for operation in ["cosign", "countersign-leafs"] {
+            let out = out_dir.join(format!("{name}.autofirma-{operation}"));
+            let mut multi = java("AfirmaMulti.java");
+            multi
+                .arg(repo().join("tests/data/certs/ec.p12"))
+                .args([operation, format])
+                .arg(&path)
+                .arg(&out);
+            if *explicit && operation == "cosign" {
+                multi.arg(&data_path);
+            }
+            let (ok, output) = run(&mut multi);
+            if !ok {
+                failures.push(format!("AutoFirma could not {operation} {name}:\n{output}"));
+                continue;
+            }
+            let theirs = std::fs::read(&out).unwrap();
+            match validation::verify(&theirs, data, None) {
+                Ok(verification) if verification.is_valid() => {}
+                other => failures.push(format!(
+                    "we reject AutoFirma's {operation} of {name}: {other:?}"
+                )),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+#[ignore]
+fn the_jdk_and_libreoffice_accept_our_office_signatures() {
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("autofirma_interop_office");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let p12 = |name: &str| {
+        let p12 = std::fs::read(repo().join("tests/data/certs").join(name)).unwrap();
+        load_pkcs12(&p12, "1234").unwrap().remove(0)
+    };
+    let (rsa, ec) = (p12("rsa.p12"), p12("ec.p12"));
+    let odt = std::fs::read(repo().join("tests/data/odf/doc.odt")).unwrap();
+    let docx = std::fs::read(repo().join("tests/data/ooxml/doc.docx")).unwrap();
+
+    let mut documents = Vec::new();
+    for digest in [DigestAlgorithm::Sha256, DigestAlgorithm::Sha512] {
+        let params = OdfParams {
+            digest,
+            utc_offset_minutes: 120,
+            ..OdfParams::new(now())
+        };
+        let signed = odf::sign(&odt, &rsa, &params).unwrap();
+        let cosigned = odf::sign(&signed, &ec, &params).unwrap();
+        documents.push((format!("{digest:?}.odt"), cosigned));
+        let params = OoxmlParams {
+            digest,
+            utc_offset_minutes: 120,
+            comments: Some("Aprobado".to_string()),
+            ..OoxmlParams::new(now())
+        };
+        let signed = ooxml::sign(&docx, &rsa, &params).unwrap();
+        let cosigned = ooxml::sign(&signed, &ec, &params).unwrap();
+        documents.push((format!("{digest:?}.docx"), cosigned));
+    }
+
+    let mut failures = Vec::new();
+    let mut odf_paths = Vec::new();
+    for (name, document) in &documents {
+        let path = out_dir.join(name);
+        std::fs::write(&path, document).unwrap();
+        let (ok, output) = run(java("AfirmaValidate.java").arg(&path));
+        if !ok {
+            failures.push(format!("the JDK rejected {name}:\n{output}"));
+        }
+        if name.ends_with(".odt") {
+            odf_paths.push(path.clone());
+        }
+        // AutoFirma signs our signed document again.
+        let format = if name.ends_with(".odt") {
+            "odf"
+        } else {
+            "ooxml"
+        };
+        let out = out_dir.join(format!("autofirma-{name}"));
+        let (ok, output) = run(java("AfirmaMulti.java")
+            .arg(repo().join("tests/data/certs/rsa.p12"))
+            .args(["cosign", format])
+            .arg(&path)
+            .arg(&out));
+        if !ok {
+            failures.push(format!("AutoFirma could not sign {name}:\n{output}"));
+            continue;
+        }
+        let theirs = std::fs::read(&out).unwrap();
+        match validation::verify(&theirs, None, None) {
+            Ok(verification) if verification.is_valid() => {}
+            other => failures.push(format!(
+                "we reject AutoFirma's signature of {name}: {other:?}"
+            )),
+        }
+        if name.ends_with(".odt") {
+            odf_paths.push(out);
+        }
+    }
+
+    let (ok, output) = run(Command::new("python3")
+        .arg(repo().join("tools/lo_verify.py"))
+        .args(&odf_paths));
+    if !ok {
+        failures.push(format!(
+            "LibreOffice rejected our ODF signatures:\n{output}"
+        ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
