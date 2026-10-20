@@ -3,13 +3,228 @@
   <head>
     <meta charset="utf-8" />
     <title>autofirma-rs: firma electrónica en el navegador</title>
-    <meta name="description" content="Firma y verifica documentos (CAdES, PAdES, XAdES) en su navegador. Los ficheros no salen de su equipo.">
+    <meta name="description" content="Firma y verifica documentos (CAdES, PAdES, XAdES, FacturaE) en su navegador, con los valores por defecto de AutoFirma. Los ficheros no salen de su equipo.">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" type="image/svg+xml" href="img/favicon.svg" />
     <link rel="stylesheet" type="text/css" href="css/main.css" />
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "inLanguage": "es",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "¿Cómo firmo un PDF para presentarlo en un trámite?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Importe su certificado .p12 o .pfx desde el botón de la cabecera, arrastre el PDF y deje las opciones como están. El resumen debe decir PAdES dentro del PDF, SHA-512, sin política de firma, firma invisible y sin sello de tiempo. Pulse Firmar y descargue el fichero nombre_signed.pdf: ese es el que se adjunta. Es el uso más habitual de AutoFirma, y la firma no se ve en la página."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Qué formato elige según el fichero, y con qué opciones?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "El formato depende del contenido, como en AutoFirma. Un PDF se firma en PAdES dentro del documento (nombre_signed.pdf). Un XML, en XAdES envolvente (nombre.xml.xsig). Una factura Facturae, en FacturaE como emisor con la política Facturae 3.1. Un OpenDocument o un Office, con la firma dentro del documento. Cualquier otro fichero, en CAdES explícita: un .csig aparte, y hay que conservar el original. En todos los casos la huella es SHA-512, sin política de la AGE, sin sello de tiempo y sin firma visible. Varios ficheros se firman cada uno así y se descargan en firmas.zip."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Cuándo debo cambiar el algoritmo, la política de la AGE o el modo de la firma?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Si el trámite solo dice que firme con AutoFirma, no cambie nada. En Personalizar, elija SHA-256 o SHA-384 si se lo piden, y la política de firma de la AGE v1.9 si la exigen: en un PDF basta con la política; en CAdES ese perfil lleva además los datos dentro de la firma, y en XAdES el formato separado. La CAdES implícita junta documento y firma en un solo fichero. La XAdES envuelta mete la firma dentro del XML. La firma visible, el motivo y la certificación solo aplican a un PDF. El sello de tiempo necesita la dirección de una TSA que acepte peticiones desde esta página."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Cómo firmo una factura electrónica FacturaE?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Abra el XML de la factura. Si es una Facturae, el formato pasa a FacturaE: firma como emisor y aplica la política Facturae 3.1, y el resultado es un .xsig. En Personalizar puede firmar como receptor o como tercero. Una factura que ya está firmada no se cofirma: por defecto se contrafirma la última firma."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Cómo añado mi firma a un documento que ya está firmado?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Abra el documento: se comprueba y puede añadir la suya. En un PDF, un OpenDocument o un Office ya firmado, su firma se añade y las anteriores siguen. En una firma CAdES, XAdES o un contenedor ASiC-S, por defecto se cofirma: usted firma los mismos datos. En una factura ya firmada, por defecto se contrafirma la última firma. Contrafirmar firma la firma de otra persona, no el documento otra vez."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Cómo compruebo que una firma es válida?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Arrastre el PDF firmado, el .xsig, el .csig, el .asics o el documento de Office. Se comprueba al momento si los datos no han cambiado y si cada firma corresponde a su certificado. Una CAdES explícita no trae el documento: hay que seleccionar también el fichero original. Una XAdES separada hecha aquí lleva los datos y la firma en el mismo XML. No se consulta si el certificado es de confianza ni si está revocado: para eso sirve un validador como VALIDe."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Qué certificado puedo usar? ¿Vale el DNIe?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Importe un almacén PKCS#12 (.p12 o .pfx) con su contraseña. Se ofrecen los certificados vigentes y aptos para firmar. La clave se descifra solo en la memoria de esta pestaña y desaparece al cerrarla. No lee el DNIe, una tarjeta ni el almacén del sistema: si el certificado no se puede exportar, fírmelo con el AutoFirma de escritorio."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Salen de mi equipo el documento y la clave?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No, en el uso normal: tras cargar la página, la firma se calcula en el navegador con WebAssembly. No hay cookies. Las opciones distintas del valor por defecto se recuerdan en el almacenamiento local de este navegador; el certificado no. Solo salen datos si escribe la dirección de una TSA, de un servidor de firma trifásica o del lote del pie de página. En el lote, los documentos se quedan en el servidor y aquí solo se firman las prefirmas."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "¿Sustituye al AutoFirma que abre la sede electrónica?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Las sedes que abren AutoFirma con el enlace afirma:// necesitan el programa de escritorio instalado. Esta página firma un fichero que usted ya tiene: lo descarga, lo firma y adjunta el resultado. Sirve para el mismo trabajo que la ventana de AutoFirma cuando el trámite admite un documento firmado."
+          }
+        }
+      ]
+    }
+    </script>
   </head>
   <body>
     <div id="autofirmaApp"><script src="js/index.js" type="module"></script><p class="loading" aria-live="polite">Cargando…</p></div>
     <noscript>autofirma-rs necesita JavaScript y WebAssembly.</noscript>
+    <section class="faq" aria-labelledby="faq_title">
+      <h2 id="faq_title">Preguntas frecuentes</h2>
+      <p>Los valores de partida son los de AutoFirma. Si el resumen «Se firmará así» no dice otra cosa, no hace falta abrir «Personalizar».</p>
+
+      <details>
+        <summary>¿Cómo firmo un PDF para presentarlo en un trámite?</summary>
+        <p>Es el uso más habitual de AutoFirma, y aquí funciona igual.</p>
+        <ol>
+          <li>Pulse el certificado de la cabecera e importe su fichero <code>.p12</code> o <code>.pfx</code> con su contraseña.</li>
+          <li>Arrastre el PDF a la página, o pulse «Seleccionar ficheros».</li>
+          <li>Deje las opciones como están. El resumen debe decir: PAdES, dentro del PDF; SHA-512; sin política de firma; firma invisible; sin sello de tiempo.</li>
+          <li>Pulse «Firmar» y descargue <code>nombre_signed.pdf</code>.</li>
+        </ol>
+        <p>Ese PDF, y no el original, es el que se adjunta en la sede. La firma va dentro del documento y no se dibuja en la página.</p>
+      </details>
+
+      <details>
+        <summary>¿Qué formato elige según el fichero, y con qué opciones?</summary>
+        <p>AutoFirma elige el formato por el contenido del fichero, no por el nombre. Esta aplicación hace lo mismo y lo escribe en el resumen antes de firmar.</p>
+        <div class="faq-table">
+          <table>
+            <caption>Formato por defecto de AutoFirma según el fichero</caption>
+            <thead>
+              <tr>
+                <th scope="col">Qué abre</th>
+                <th scope="col">Por defecto</th>
+                <th scope="col">Se descarga</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>PDF</td>
+                <td>PAdES, firma dentro del PDF, invisible</td>
+                <td><code>nombre_signed.pdf</code></td>
+              </tr>
+              <tr>
+                <td>XML</td>
+                <td>XAdES envolvente: el XML queda dentro de la firma</td>
+                <td><code>nombre.xml.xsig</code></td>
+              </tr>
+              <tr>
+                <td>Factura electrónica (XML Facturae)</td>
+                <td>FacturaE, como emisor, con la política Facturae 3.1</td>
+                <td><code>nombre.xml.xsig</code></td>
+              </tr>
+              <tr>
+                <td>OpenDocument (odt, ods, odp)</td>
+                <td>ODF, firma dentro del documento</td>
+                <td><code>nombre_signed.odt</code></td>
+              </tr>
+              <tr>
+                <td>Office (docx, xlsx, pptx)</td>
+                <td>OOXML, firma dentro del documento</td>
+                <td><code>nombre_signed.docx</code></td>
+              </tr>
+              <tr>
+                <td>Cualquier otro (imagen, ZIP, texto, binario)</td>
+                <td>CAdES explícita: la firma va en un fichero aparte</td>
+                <td><code>nombre.csig</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Salvo que lo cambie en «Personalizar», toda firma usa además:</p>
+        <ul>
+          <li>Huella SHA-512. Con un certificado RSA la firma es SHA512withRSA; con uno de curva elíptica, SHA512withECDSA.</li>
+          <li>Ninguna política de firma: es una firma básica (perfil BES). La política de la AGE no se aplica sola.</li>
+          <li>Ni sello de tiempo ni servidor de firma trifásica.</li>
+          <li>Ni lugar, ni motivo, ni certificación del PDF.</li>
+          <li>Si activa la firma visible, el texto sale en Courier de 12 puntos, la fuente por defecto de AutoFirma.</li>
+        </ul>
+        <p>Varios ficheros a la vez se firman cada uno con el formato de la tabla y se descargan juntos en <code>firmas.zip</code>.</p>
+        <p>Una CAdES explícita no contiene el documento. Conserve el fichero original junto al <code>.csig</code>: sin él no se puede comprobar la firma.</p>
+      </details>
+
+      <details>
+        <summary>¿Cuándo debo cambiar el algoritmo, la política de la AGE o el modo de la firma?</summary>
+        <p>Casi nunca en un PDF. Si el trámite dice «firme con AutoFirma» y no concreta más, los valores de arriba son los que espera.</p>
+        <p>Ábralo en «Personalizar» cuando las instrucciones pidan otra cosa. Lo que cambie queda marcado, y «Restablecer los valores predeterminados» vuelve a los de AutoFirma. Una dirección de servidor de sellado o de firma que ya haya escrito se conserva.</p>
+        <ul>
+          <li><strong>SHA-256 o SHA-384.</strong> Algunas sedes antiguas piden SHA-256. SHA-1 no se ofrece para firmar; solo se lee al comprobar firmas viejas.</li>
+          <li><strong>Política de firma de la AGE v1.9</strong>, si el trámite la exige. En un PDF basta con elegirla. En CAdES, el perfil que documenta AutoFirma para esa política lleva además los datos dentro de la firma (modo implícito); en XAdES, el formato separado. Cámbielos en el mismo panel si las instrucciones lo dicen. La v1.8 queda para trámites que aún la nombran. El documento de la política está en la <a href="https://sede.administracion.gob.es/politica_de_firma_anexo_1.pdf" target="_blank" rel="noopener external nofollow">sede de la Administración</a>.</li>
+          <li><strong>CAdES implícita</strong> («Dentro de la firma»), si le piden un solo fichero con el documento y la firma. El resultado pesa más.</li>
+          <li><strong>XAdES envuelta</strong> («la firma dentro del XML»), si quien recibe tiene que seguir leyendo el XML original con la firma incorporada. La separada deja los datos y la firma en un XML nuevo.</li>
+          <li><strong>Contenedor ASiC-S</strong>, si le piden el fichero y la firma juntos en un ZIP. Está en «Personalizar», para CAdES y XAdES.</li>
+          <li><strong>Firma visible, motivo o certificación</strong>, solo en un PDF y solo si se lo piden. La visible se coloca sobre la página.</li>
+          <li><strong>Sello de tiempo</strong>, si le dan la dirección de una autoridad de sellado (TSA) que acepte peticiones desde esta página. Sin esa dirección no se puede sellar.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>¿Cómo firmo una factura electrónica FacturaE?</summary>
+        <p>Abra el XML de la factura. Si la raíz es <code>Facturae</code> y trae cabecera, partes y facturas, el formato pasa a FacturaE y no hace falta cambiarlo. Por defecto firma como emisor y aplica la política de firma Facturae 3.1, que es la de AutoFirma. Descargue el <code>.xsig</code>.</p>
+        <p>En «Personalizar» puede firmar como receptor o como tercero. Una factura que ya está firmada no se cofirma: la operación por defecto es contrafirmar la última firma, que es lo que hace quien la recibe.</p>
+      </details>
+
+      <details>
+        <summary>¿Cómo añado mi firma a un documento que ya está firmado?</summary>
+        <p>Abra el documento o la firma. Se comprueba y, debajo, puede añadir la suya.</p>
+        <ul>
+          <li>Un PDF, un OpenDocument o un Office ya firmado: su firma se añade y las anteriores siguen siendo válidas.</li>
+          <li>Una firma CAdES, XAdES o un contenedor ASiC-S: por defecto se cofirma. Usted firma los mismos datos que los demás. Si la CAdES no incluye los datos y usa otro algoritmo, tendrá que indicar también el fichero original.</li>
+          <li>Una factura ya firmada: por defecto se contrafirma la última firma. También puede contrafirmar todas.</li>
+        </ul>
+        <p>Contrafirmar firma la firma de otra persona, no el documento otra vez. Úselo cuando el trámite pida un visto bueno sobre la firma que ya existe.</p>
+      </details>
+
+      <details>
+        <summary>¿Cómo compruebo que una firma es válida?</summary>
+        <p>Arrastre el PDF firmado, el <code>.xsig</code>, el <code>.csig</code>, el contenedor <code>.asics</code> o el documento de Office. La comprobación es inmediata: dice si cada firma corresponde a su certificado y si los datos no han cambiado, quién firmó y con qué algoritmo.</p>
+        <p>Si la firma es CAdES explícita, el <code>.csig</code> no trae el documento y le pedirá el fichero que se firmó. Sin él no hay bastante para decidir. Una XAdES separada hecha aquí lleva los datos y la firma en el mismo XML, así que se comprueba sola. Si la firma apunta a un fichero de fuera, también tendrá que seleccionarlo.</p>
+        <p>No se consulta si el certificado es de confianza ni si está revocado. Para eso hace falta un validador de la Administración, como <a href="https://valide.redsara.es/valide/" target="_blank" rel="noopener external nofollow">VALIDe</a>, o el panel de firmas del propio PDF.</p>
+      </details>
+
+      <details>
+        <summary>¿Qué certificado puedo usar? ¿Vale el DNIe?</summary>
+        <p>Importe un almacén PKCS#12 (<code>.p12</code> o <code>.pfx</code>) y escriba su contraseña. Se muestran los certificados vigentes y aptos para firmar; puede mostrar el resto si lo necesita. La clave se descifra en esta pestaña y se olvida al cerrarla: no se guarda en el disco ni se envía a ningún sitio.</p>
+        <p>No lee el DNIe, una tarjeta, ni el almacén de certificados del sistema. Esos son los que usa el AutoFirma de escritorio. Si su certificado no se puede exportar, que es lo normal en el DNIe, fírmelo con ese programa.</p>
+      </details>
+
+      <details>
+        <summary>¿Salen de mi equipo el documento y la clave?</summary>
+        <p>No, en el uso normal. La página se carga una vez y a partir de ahí la firma se calcula en su navegador, con <a href="https://es.wikipedia.org/wiki/WebAssembly" target="_blank" rel="noopener external nofollow">WebAssembly</a>. No hay cookies. Las opciones que cambie respecto del valor por defecto se recuerdan en el almacenamiento local de este navegador; el certificado no.</p>
+        <p>Hay dos excepciones, y las dos están apagadas hasta que escriba una dirección en «Personalizar»: el sello de tiempo, que envía la huella a la TSA, y la firma trifásica. El enlace «Lote de un servicio de firma», en el pie, es la otra: el servidor guarda los documentos y aquí solo se firman las prefirmas que él prepara.</p>
+      </details>
+
+      <details>
+        <summary>¿Sustituye al AutoFirma que abre la sede electrónica?</summary>
+        <p>No. Muchas sedes abren el AutoFirma instalado mediante el enlace <code>afirma://</code>. Esa llamada necesita el programa de escritorio. Aquí se firma un fichero que usted ya tiene: lo descarga, lo firma y adjunta el resultado.</p>
+        <p>Sirve para el mismo trabajo que la ventana de AutoFirma cuando el trámite le deja subir un documento firmado: el PDF de una solicitud, una factura FacturaE, una cofirma, una contrafirma, varios ficheros a la vez, o un documento de Office.</p>
+      </details>
+
+      <p class="faq-note">autofirma-rs es un programa independiente. No es el AutoFirma oficial de la Administración ni está asociado a ella. El autor no se hace responsable del uso de las firmas generadas: compruebe siempre lo que pide el trámite. Para un fallo o una mejora, abra un <a href="https://github.com/vaijira/autofirma-rs/issues/new" target="_blank" rel="external nofollow">ticket</a>.</p>
+    </section>
   </body>
 </html>
